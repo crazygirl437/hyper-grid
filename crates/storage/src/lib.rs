@@ -208,7 +208,7 @@ impl Storage {
         let root = dirs.data_dir().to_path_buf();
         fs::create_dir_all(&root)?;
         let mut storage = Self::open(&root)?;
-        // User-facing `.env` lives under the program/workspace directory.
+        // User-facing `.env` lives next to the runnable program.
         storage.env_file = env_file::env_path();
         Ok(storage)
     }
@@ -227,7 +227,7 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Path of the synced `.env` (under program/workspace dir).
+    /// Path of the synced `.env` (next to the program binary / AppImage / .app).
     pub fn dotenv_path(&self) -> &Path {
         &self.env_file
     }

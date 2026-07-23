@@ -1,8 +1,10 @@
 name: release
 
-# Push a version tag to build installers and attach them to a GitHub Release:
-#   git tag v0.1.0 && git push origin v0.1.0
-# Or run manually: Actions → release → Run workflow
+# Desktop portable builds only (no installers, no CLI):
+#   Linux AppImage · Windows .exe · macOS .app (Apple Silicon + Intel)
+#
+#   git tag v0.1.1 && git push origin v0.1.1
+#   Or: Actions → release → Run workflow
 
 on:
   push:
@@ -11,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create/update (e.g. v0.1.0). Leave empty when triggered by a tag push."
+        description: "Release tag to create/update (e.g. v0.1.1). Leave empty when triggered by a tag push."
         required: false
         default: ""
 
@@ -26,34 +28,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test crates
         run: cargo test -p grid-engine -p exchange -p storage
-      - name: CLI smoke
-        run: |
-          cargo run -p hyper-grid-cli -- preview --levels 5
-          cargo run -p hyper-grid-cli -- sim --ticks 10
-
-  cli-linux-static:
-    needs: test
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build static CLI
-        run: cargo build -p hyper-grid-cli --release --target x86_64-unknown-linux-musl
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/hyper-grid-cli dist/hyper-grid-cli-linux-x86_64
-          chmod +x dist/hyper-grid-cli-linux-x86_64
-          file dist/hyper-grid-cli-linux-x86_64
-          ./dist/hyper-grid-cli-linux-x86_64 --help
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-cli-linux
-          path: dist/hyper-grid-cli-linux-x86_64
 
   desktop:
     needs: test
@@ -61,28 +35,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: linux
+          - id: linux-x64
             platform: ubuntu-22.04
-            args: ""
-            bundles: appimage,deb
-          - id: macos
-            platform: macos-14
-            args: --target aarch64-apple-darwin
-            bundles: dmg
-          - id: windows
+            rust_target: ""
+            kind: linux-appimage
+          - id: windows-x64
             platform: windows-latest
-            args: --target x86_64-pc-windows-msvc
-            bundles: nsis
+            rust_target: x86_64-pc-windows-msvc
+            kind: windows-exe
+          - id: macos-arm64
+            platform: macos-14
+            rust_target: aarch64-apple-darwin
+            kind: macos-app
+          - id: macos-x64
+            platform: macos-14
+            rust_target: x86_64-apple-darwin
+            kind: macos-app
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust toolchain (host)
+        if: matrix.rust_target == ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust toolchain (cross target)
+        if: matrix.rust_target != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Linux deps
-        if: matrix.id == 'linux'
+        if: matrix.kind == 'linux-appimage'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -94,34 +82,64 @@ jobs:
         working-directory: apps/desktop
         run: npm install
 
-      - name: Build Tauri
+      - name: Build Linux AppImage
+        if: matrix.kind == 'linux-appimage'
         working-directory: apps/desktop
-        run: npm exec -- tauri build --bundles ${{ matrix.bundles }} ${{ matrix.args }}
+        run: npm exec -- tauri build --bundles appimage
 
-      - name: Collect Linux packages
-        if: matrix.id == 'linux'
+      - name: Build Windows portable exe
+        if: matrix.kind == 'windows-exe'
+        working-directory: apps/desktop
+        run: npm exec -- tauri build --no-bundle --target ${{ matrix.rust_target }}
+
+      - name: Build macOS .app
+        if: matrix.kind == 'macos-app'
+        working-directory: apps/desktop
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: npm exec -- tauri build --bundles app --target ${{ matrix.rust_target }}
+
+      - name: Collect Linux AppImage
+        if: matrix.kind == 'linux-appimage'
         shell: bash
         run: |
           mkdir -p dist
-          cp -v target/release/bundle/appimage/*.AppImage dist/ || true
-          cp -v target/release/bundle/deb/*.deb dist/ || true
+          src=$(ls target/release/bundle/appimage/*.AppImage | head -n1)
+          cp -v "$src" dist/hyper-grid-linux-x86_64.AppImage
+          chmod +x dist/hyper-grid-linux-x86_64.AppImage
           ls -lah dist
 
-      - name: Collect macOS packages
-        if: matrix.id == 'macos'
+      - name: Collect Windows exe
+        if: matrix.kind == 'windows-exe'
         shell: bash
         run: |
           mkdir -p dist
-          find target -type f \( -name '*.dmg' -o -name '*.app.tar.gz' \) -print -exec cp -v {} dist/ \;
-          ls -lah dist || true
+          src="target/${{ matrix.rust_target }}/release/hyper-grid.exe"
+          if [ ! -f "$src" ]; then
+            src="target/release/hyper-grid.exe"
+          fi
+          cp -v "$src" dist/hyper-grid-windows-x64.exe
+          ls -lah dist
 
-      - name: Collect Windows packages
-        if: matrix.id == 'windows'
+      - name: Collect macOS .app archive
+        if: matrix.kind == 'macos-app'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
-          find target -type f \( -name '*.exe' -o -name '*.msi' \) -path '*/bundle/*' -print -exec cp -v {} dist/ \;
-          ls -lah dist || true
+          arch_label="${{ matrix.id }}"
+          arch_label="${arch_label#macos-}"
+          app_dir=$(find "target/${{ matrix.rust_target }}/release/bundle/macos" -maxdepth 1 -name '*.app' -type d | head -n1)
+          if [ -z "$app_dir" ]; then
+            echo "No .app found under target/${{ matrix.rust_target }}/release/bundle/macos"
+            find target -name '*.app' -type d | head -20 || true
+            exit 1
+          fi
+          parent=$(dirname "$app_dir")
+          base=$(basename "$app_dir")
+          out="dist/hyper-grid-macos-${arch_label}.app.tar.gz"
+          tar -C "$parent" -czf "$out" "$base"
+          ls -lah dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -130,9 +148,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [cli-linux-static, desktop]
+    needs: [desktop]
     runs-on: ubuntu-22.04
-    # Only attach files to a GitHub Release when a version tag was pushed (or given).
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
     steps:
       - uses: actions/checkout@v4
@@ -167,6 +184,17 @@ jobs:
           draft: false
           generate_release_notes: true
           fail_on_unmatched_files: false
+          body: |
+            Portable desktop builds (no installers):
+
+            | File | Platform |
+            |------|----------|
+            | `hyper-grid-linux-x86_64.AppImage` | Linux x64 — `chmod +x` then run |
+            | `hyper-grid-windows-x64.exe` | Windows x64 — double-click |
+            | `hyper-grid-macos-arm64.app.tar.gz` | Apple Silicon (M1/M2/M3…) — extract, open `.app` |
+            | `hyper-grid-macos-x64.app.tar.gz` | Intel Mac — extract, open `.app` |
+
+            Linux AppImage is built on Ubuntu 22.04 (needs glibc 2.35+; Ubuntu 20.04 not supported).
           files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

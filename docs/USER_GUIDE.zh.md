@@ -6,7 +6,11 @@ hyper-grid 是本地运行的 Hyperliquid **永续合约网格**桌面软件。�
 
 ## 安装
 
-请从 **GitHub Releases** 下载对应系统的安装包。优先使用 Release 里的官方包（由 CI 构建，兼容性更好）。
+从 **GitHub Releases** 下载**便携版**（无需安装包）：
+
+- Windows：`.exe` 双击运行
+- macOS：`.app.tar.gz`（苹果芯片或 Intel 选对应文件，解压后打开）
+- Linux：`.AppImage`（`chmod +x` 后运行；需 Ubuntu 22.04+）
 
 ## 第一次使用
 

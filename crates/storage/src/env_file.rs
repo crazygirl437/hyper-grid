@@ -1,7 +1,7 @@
 //! `.env` config sync for hyper-grid.
 //!
-//! File lives under the program/workspace directory (not OS app-data), so users
-//! can open and edit it next to the project. Format is classic KEY=VALUE lines.
+//! File lives next to the runnable program so portable builds (exe / AppImage / .app)
+//! keep settings beside the binary the user launched.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,62 +14,66 @@ use crate::AppConfig;
 
 const ENV_HEADER: &str = "# hyper-grid settings — edited by the app; you can also edit manually\n";
 
-/// Resolve the directory that owns `.env` ("程序下").
+/// Directory that owns `.env` (same folder as the program the user runs).
 ///
 /// Priority:
 /// 1. `HYPER_GRID_HOME`
-/// 2. Walk up from cwd / exe looking for the hyper-grid workspace root
-/// 3. Executable parent directory
-/// 4. Current working directory
+/// 2. Directory of `$APPIMAGE` (Linux AppImage launches)
+/// 3. Directory containing the `.app` bundle (macOS)
+/// 4. Directory of the executable
+/// 5. Current working directory
 pub fn resolve_program_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HYPER_GRID_HOME") {
-        let p = PathBuf::from(home);
+        let p = PathBuf::from(home.trim());
         if !p.as_os_str().is_empty() {
             return p;
         }
     }
 
-    let mut starts: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        starts.push(cwd);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            starts.push(parent.to_path_buf());
-        }
-    }
-
-    for start in starts {
-        let mut cur = start;
-        for _ in 0..10 {
-            if is_program_root(&cur) {
-                return cur;
-            }
-            if !cur.pop() {
-                break;
+    // AppImage: current_exe() points inside the mount; the real file is $APPIMAGE.
+    if let Ok(appimage) = std::env::var("APPIMAGE") {
+        let p = PathBuf::from(appimage);
+        if let Some(parent) = p.parent() {
+            if parent.as_os_str().len() > 0 {
+                return parent.to_path_buf();
             }
         }
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.to_path_buf();
+        if let Some(dir) = dir_beside_program(&exe) {
+            return dir;
         }
     }
+
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn is_program_root(dir: &Path) -> bool {
-    let cargo = dir.join("Cargo.toml");
-    if !cargo.is_file() {
-        return false;
+/// For a normal binary: return its parent dir.
+/// For `Foo.app/Contents/MacOS/hyper-grid`: return the folder that contains `Foo.app`.
+fn dir_beside_program(exe: &Path) -> Option<PathBuf> {
+    let mut cur = exe.parent()?.to_path_buf();
+
+    // macOS app bundle: .../Something.app/Contents/MacOS/<exe>
+    // Put .env next to Something.app (what users see), not deep inside Contents.
+    let components: Vec<_> = cur.components().map(|c| c.as_os_str().to_owned()).collect();
+    if components.len() >= 3 {
+        let n = components.len();
+        let mac_os = components[n - 1].to_string_lossy() == "MacOS";
+        let contents = components[n - 2].to_string_lossy() == "Contents";
+        let app_name = components[n - 3].to_string_lossy();
+        if mac_os && contents && app_name.ends_with(".app") {
+            // parent of the .app bundle
+            for _ in 0..3 {
+                if !cur.pop() {
+                    break;
+                }
+            }
+            return Some(cur);
+        }
     }
-    let Ok(text) = fs::read_to_string(&cargo) else {
-        return false;
-    };
-    text.contains("[workspace]")
-        || text.contains("name = \"hyper-grid\"")
-        || text.contains("name = 'hyper-grid'")
+
+    Some(cur)
 }
 
 pub fn env_path() -> PathBuf {
@@ -210,5 +214,23 @@ mod tests {
         assert_eq!(loaded.grid_count, 12);
         assert!(!loaded.is_cross);
         assert_eq!(loaded.language.as_deref(), Some("zh-CN"));
+    }
+
+    #[test]
+    fn dir_beside_plain_exe() {
+        let exe = PathBuf::from("/opt/hyper-grid/hyper-grid");
+        assert_eq!(
+            dir_beside_program(&exe).unwrap(),
+            PathBuf::from("/opt/hyper-grid")
+        );
+    }
+
+    #[test]
+    fn dir_beside_macos_app_bundle() {
+        let exe = PathBuf::from("/Users/me/Desktop/hyper-grid.app/Contents/MacOS/hyper-grid");
+        assert_eq!(
+            dir_beside_program(&exe).unwrap(),
+            PathBuf::from("/Users/me/Desktop")
+        );
     }
 }

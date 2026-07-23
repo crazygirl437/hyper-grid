@@ -8,7 +8,7 @@ You set a price range and size. The app places buys below the market and sells a
 
 > **Recommended:** download a ready-made build from Releases. You do **not** need to compile on your laptop.
 >
-> **Maintainers:** package with **GitHub Actions** (not your local PC) — push a `v*` tag and installers appear on the Releases page.
+> **Maintainers:** package with **GitHub Actions** — push a `v*` tag; portable desktop apps appear on the Releases page.
 
 ---
 
@@ -23,14 +23,18 @@ You set a price range and size. The app places buys below the market and sells a
 ## Download & run (recommended)
 
 1. Open **[Releases](../../releases)** on GitHub.
-2. Download for your OS:
-   - **Windows** → `.exe` installer  
-   - **macOS** → `.dmg`  
-   - **Linux desktop** → `.AppImage` or `.deb` (**built on Ubuntu 22.04** for broader glibc compatibility)  
-   - **Linux CLI (most portable)** → `hyper-grid-cli-linux-x86_64` (static musl binary — runs on almost any x86_64 Linux)
-3. Install / open, then start the app.
+2. Download the portable app for your OS (no installer):
+   - **Windows** → `hyper-grid-windows-x64.exe` (double-click)
+   - **macOS Apple Silicon** → `hyper-grid-macos-arm64.app.tar.gz` (extract, open the `.app`)
+   - **macOS Intel** → `hyper-grid-macos-x64.app.tar.gz` (extract, open the `.app`)
+   - **Linux** → `hyper-grid-linux-x86_64.AppImage` — then:
+     ```bash
+     chmod +x hyper-grid-linux-x86_64.AppImage
+     ./hyper-grid-linux-x86_64.AppImage
+     ```
+3. Start trading (try **Simulation** first).
 
-**Linux tip:** GUI installers on Releases are built on **Ubuntu 22.04** via GitHub Actions. Prefer those over a binary compiled on a newer desktop OS.
+**Linux note:** AppImage is built on **Ubuntu 22.04** (needs a recent glibc). Ubuntu **20.04** is not supported for the GUI build.
 
 ---
 
@@ -75,7 +79,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-When Actions finishes, open **Releases** and download the installers.
+When Actions finishes, open **Releases** and download the portable apps.
 
 ---
 

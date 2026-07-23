@@ -6,7 +6,11 @@ hyper-grid is a local desktop app for **perpetual grid trading** on Hyperliquid.
 
 ## Install
 
-Download from **GitHub Releases** (Windows / macOS / Linux). Prefer the official Release builds — they are packaged by CI for better compatibility.
+Download a **portable** build from **GitHub Releases** (no installer):
+
+- Windows: `.exe`
+- macOS: `.app.tar.gz` (Apple Silicon or Intel)
+- Linux: `.AppImage` (`chmod +x` then run; Ubuntu 22.04+)
 
 ## First run
 

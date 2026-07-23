@@ -6,9 +6,9 @@
 
 设定价格区间和投入后，程序会在现价下方挂买、上方挂卖，希望行情在区间内波动时赚取差价。
 
-> **推荐：** 直接下载 GitHub Releases 里已经编译好的安装包，**不必在本机编译**。
+> **推荐：** 直接下载 GitHub Releases 里的便携版，**不必在本机编译**。
 >
-> **维护者：** 请用 **GitHub Actions** 打包（不要在自己电脑上硬编）——推送 `v*` 标签后，安装包会出现在 Releases 页面。
+> **维护者：** 请用 **GitHub Actions** 打包——推送 `v*` 标签后，可直接运行的桌面程序会出现在 Releases。
 
 ---
 
@@ -20,17 +20,21 @@
 
 ---
 
-## 下载安装（推荐）
+## 下载运行（推荐）
 
 1. 打开 **[Releases（发布页）](../../releases)**。
-2. 按系统下载：
-   - **Windows** → `.exe`  
-   - **macOS** → `.dmg`  
-   - **Linux 桌面版** → `.AppImage` / `.deb`（由 **Ubuntu 22.04** 构建，兼容性更好）  
-   - **Linux 命令行（兼容性最好）** → `hyper-grid-cli-linux-x86_64`（musl 静态包）
-3. 安装或打开即可。
+2. 按系统下载**便携版**（不是安装包）：
+   - **Windows** → `hyper-grid-windows-x64.exe`（双击运行）
+   - **macOS 苹果芯片** → `hyper-grid-macos-arm64.app.tar.gz`（解压后打开 `.app`）
+   - **macOS Intel** → `hyper-grid-macos-x64.app.tar.gz`（解压后打开 `.app`）
+   - **Linux** → `hyper-grid-linux-x86_64.AppImage`，然后：
+     ```bash
+     chmod +x hyper-grid-linux-x86_64.AppImage
+     ./hyper-grid-linux-x86_64.AppImage
+     ```
+3. 建议先用 **模拟盘** 试跑。
 
-**Linux 提示：** Releases 里的桌面安装包由 GitHub Actions 在 Ubuntu 22.04 上构建。请优先用它们，而不是在新系统本机自己编译的包。
+**Linux 说明：** AppImage 在 **Ubuntu 22.04** 上构建，需要较新的 glibc；**Ubuntu 20.04 跑不了**桌面版。
 
 ---
 
@@ -75,7 +79,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-等 Actions 跑完后，到 **Releases** 下载安装包。
+等 Actions 跑完后，到 **Releases** 下载便携程序。
 
 ---
 
