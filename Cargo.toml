@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grid-engine",
+    "crates/exchange",
+    "crates/storage",
+    "crates/hyper-grid-cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["hyper-grid contributors"]
+repository = "https://github.com/hyper-grid/hyper-grid"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+async-trait = "0.1"
+anyhow = "1"

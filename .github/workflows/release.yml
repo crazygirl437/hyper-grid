@@ -1,0 +1,172 @@
+name: release
+
+# Push a version tag to build installers and attach them to a GitHub Release:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Or run manually: Actions → release → Run workflow
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update (e.g. v0.1.0). Leave empty when triggered by a tag push."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test crates
+        run: cargo test -p grid-engine -p exchange -p storage
+      - name: CLI smoke
+        run: |
+          cargo run -p hyper-grid-cli -- preview --levels 5
+          cargo run -p hyper-grid-cli -- sim --ticks 10
+
+  cli-linux-static:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build static CLI
+        run: cargo build -p hyper-grid-cli --release --target x86_64-unknown-linux-musl
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/hyper-grid-cli dist/hyper-grid-cli-linux-x86_64
+          chmod +x dist/hyper-grid-cli-linux-x86_64
+          file dist/hyper-grid-cli-linux-x86_64
+          ./dist/hyper-grid-cli-linux-x86_64 --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-cli-linux
+          path: dist/hyper-grid-cli-linux-x86_64
+
+  desktop:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux
+            platform: ubuntu-22.04
+            args: ""
+            bundles: appimage,deb
+          - id: macos
+            platform: macos-14
+            args: --target aarch64-apple-darwin
+            bundles: dmg
+          - id: windows
+            platform: windows-latest
+            args: --target x86_64-pc-windows-msvc
+            bundles: nsis
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Linux deps
+        if: matrix.id == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf libdbus-1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Frontend install
+        working-directory: apps/desktop
+        run: npm install
+
+      - name: Build Tauri
+        working-directory: apps/desktop
+        run: npm exec -- tauri build --bundles ${{ matrix.bundles }} ${{ matrix.args }}
+
+      - name: Collect Linux packages
+        if: matrix.id == 'linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -v target/release/bundle/appimage/*.AppImage dist/ || true
+          cp -v target/release/bundle/deb/*.deb dist/ || true
+          ls -lah dist
+
+      - name: Collect macOS packages
+        if: matrix.id == 'macos'
+        shell: bash
+        run: |
+          mkdir -p dist
+          find target -type f \( -name '*.dmg' -o -name '*.app.tar.gz' \) -print -exec cp -v {} dist/ \;
+          ls -lah dist || true
+
+      - name: Collect Windows packages
+        if: matrix.id == 'windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          find target -type f \( -name '*.exe' -o -name '*.msi' \) -path '*/bundle/*' -print -exec cp -v {} dist/ \;
+          ls -lah dist || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.id }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [cli-linux-static, desktop]
+    runs-on: ubuntu-22.04
+    # Only attach files to a GitHub Release when a version tag was pushed (or given).
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag name
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing as: $TAG"
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: List files
+        run: find artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: hyper-grid ${{ steps.meta.outputs.tag }}
+          draft: false
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,11 @@
+/target/
+**/target/
+**/node_modules/
+**/dist/
+**/.DS_Store
+apps/desktop/src-tauri/gen/
+*.csv
+.env
+.env.*
+.cargo-linux/
+.npm-linux/

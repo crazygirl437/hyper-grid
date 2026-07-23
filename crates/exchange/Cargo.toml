@@ -1,0 +1,31 @@
+[package]
+name = "exchange"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Exchange adapters for hyper-grid (sim + Hyperliquid)"
+
+[dependencies]
+grid-engine = { path = "../grid-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hex = "0.4"
+rand = "0.8"
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+sha3 = "0.10"
+rmp-serde = "1"
+rmpv = "1"
+serde_bytes = "0.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

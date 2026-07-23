@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p grid-engine -p exchange -p storage
+      - run: cargo run -p hyper-grid-cli -- sim --ticks 8
+      - name: Hyperliquid mid smoke
+        run: cargo run -p hyper-grid-cli -- mid --mode mainnet --symbol BTC
+        continue-on-error: true

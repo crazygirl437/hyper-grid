@@ -1,0 +1,18 @@
+[package]
+name = "grid-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spot grid trading state machine for hyper-grid"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
