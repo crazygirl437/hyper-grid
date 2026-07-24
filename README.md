@@ -1,94 +1,107 @@
 # hyper-grid
 
-**English** | [中文](README.zh-CN.md)
+**English** | [中文](./README.zh-CN.md)
 
-An easy desktop app for **grid trading** on [Hyperliquid](https://hyperliquid.xyz) perpetual futures.
+> A local desktop app for grid trading on [Hyperliquid](https://hyperliquid.xyz) perpetual futures.
 
-You set a price range and size. The app places buys below the market and sells above it — aiming to profit when price oscillates inside that range.
+Set a price range and size. The app places buys below the market and sells above it — aiming to profit when price oscillates inside that range.
 
-> **Recommended:** download a ready-made build from Releases. You do **not** need to compile on your laptop.
->
-> **Maintainers:** package with **GitHub Actions** — push a `v*` tag; portable desktop apps appear on the Releases page.
+- **Referral link:** [https://app.hyperliquid.xyz/join/MMREFCSI](https://app.hyperliquid.xyz/join/MMREFCSI) — fee discount for you; rewards for the author  
+- **Author Telegram:** [https://t.me/smith123_lee](https://t.me/smith123_lee) — if you like the app, feel free to ask about the Pro edition  
 
----
+Live account example:
 
-## Demo video
+![Portfolio](./images/Portfolio.png)
 
-<!-- Replace with your video link or embed. -->
+## Demo
 
-**[▶ Watch demo](VIDEO_URL_HERE)**
+<video src="./images/running.mp4" controls width="100%"></video>
 
----
+> This app can connect to real markets with real funds. Understand the risks first. Prefer **Simulation** or **Testnet** before going live.
 
-## Download & run (recommended)
+## How it works
 
-1. Open **[Releases](../../releases)** on GitHub.
-2. Download the portable app for your OS (no installer):
+Grid trading splits a price band into multiple levels. Roughly:
+
+1. **Define the range** — set lower/upper price, grid count, and total size; or fill ±5% around mid.
+2. **Place the grid** — relative to the live mid: **buys** below, **sells** above.
+3. **Refill on fill** — a buy fill places a sell higher; a sell fill places a buy lower, harvesting swings inside the band.
+4. **Risk & stop** — optional breakout actions, max drawdown, daily loss limits; **Stop** cancels all orders and flattens positions at market.
+
+The app does **not** deposit or withdraw for you. Manage funds on the Hyperliquid website.
+
+## Quick start
+
+### Download portable build (recommended)
+
+If you do not want to compile, download a prebuilt app from **[Releases](../../releases)**:
+
+1. Pick the file for your OS (no installer):
    - **Windows** → `hyper-grid-windows-x64.exe` (double-click)
    - **macOS Apple Silicon** → `hyper-grid-macos-arm64.app.tar.gz` (extract, open the `.app`)
    - **macOS Intel** → `hyper-grid-macos-x64.app.tar.gz` (extract, open the `.app`)
-   - **Linux** → `hyper-grid-linux-x86_64.AppImage` — then:
+   - **Linux** → `hyper-grid-linux-x86_64.AppImage`, then:
      ```bash
      chmod +x hyper-grid-linux-x86_64.AppImage
      ./hyper-grid-linux-x86_64.AppImage
      ```
-3. Start trading (try **Simulation** first).
+2. Open the app and try **Simulation** first.
+3. Switch **中文 / EN** in the top bar.
 
-**Linux note:** AppImage is built on **Ubuntu 22.04** (needs a recent glibc). Ubuntu **20.04** is not supported for the GUI build.
+**Linux note:** The AppImage is built on Ubuntu 22.04 (needs a recent glibc). Ubuntu **20.04** cannot run the desktop build.
 
----
+### Run from source
 
-## What you need before live trading
+Install [Rust](https://rustup.rs) and [Node.js](https://nodejs.org/) (20+ recommended).
 
-1. Hyperliquid funds in the **perpetuals** account  
-   ([Mainnet](https://app.hyperliquid.xyz) · [Testnet faucet](https://app.hyperliquid-testnet.xyz/drip))
-2. That wallet’s **private key** (stored only on your machine)
+```bash
+cd apps/desktop
+npm install
+npm exec tauri dev    # launch the desktop app
+```
 
-This app does **not** deposit or withdraw for you.
+On Linux you also need WebKit and related system packages (e.g. `libwebkit2gtk-4.1-dev`), or the desktop build will fail.
 
----
+## Before live trading
 
-## Quick start
+| Item | Notes |
+|------|------|
+| Hyperliquid perps balance | Deposit yourself on the site. [Mainnet](https://app.hyperliquid.xyz) · [Testnet faucet](https://app.hyperliquid-testnet.xyz/drip) |
+| Wallet private key | Stored only in a local `.env` next to the binary; Simulation can skip it |
 
-1. Open hyper-grid → try **Simulation** first (no real money).
-2. **Configure** → set symbol / range / grids / size → **Preview** → **Start**.
-3. For real trading: **Testnet** or **Mainnet**, paste key, refresh balances, then start.
+Testnet / Mainnet require a private key before start. Never share it.
 
-Language: **English / 中文** in Settings.
+## Three steps
 
----
+1. **Account** — pick Simulation / Testnet / Mainnet; for live modes paste the key and **Refresh balances**.
+2. **Configure grid** — symbol, range, levels, size, leverage → **Preview** → **Start**.
+3. **Run panel** — watch status, PnL, and fills; **Pause / Resume / Stop** as needed (Stop cancels and flattens).
+
+You can also set spacing (arithmetic / geometric), margin mode (cross / isolated), breakout behavior, max drawdown, and daily loss; import / export strategy configs is supported.
+
+## Common settings
+
+| Setting | Notes |
+|------|------|
+| Run mode | **Simulation** (no real funds) / **Testnet** / **Mainnet** |
+| Symbol | Hyperliquid perps (e.g. BTC); not spot grids |
+| Lower / upper price | Price band covered by the grid |
+| Grid levels | Number of layers in the band (start with defaults) |
+| Total notional | Planned notional in USDC; too little per level blocks start |
+| Leverage | Amplifies both gain and loss |
+| On breakout | Alert only / Pause / Cancel & pause |
+| Max drawdown / daily loss | Circuit breaker; stops new orders |
 
 ## Safety
 
-- You can lose money — especially with high leverage.
-- Never share your private key.
+- Crypto and perps are risky; you can lose money — higher leverage means higher risk.
+- Keep the private key on this machine only; never send it to anyone or upload it.
 - Practice on Simulation / Testnet first; start small on mainnet.
-- Stop cancels orders and closes positions.
+- On Stop, quit, or restart, the app tries to cancel orders and flatten — watch fees and positions.
 
----
+## Disclaimer
 
-## How maintainers ship builds (GitHub)
-
-See **[docs/RELEASING.md](docs/RELEASING.md)** for the full steps.
-
-Short version:
-
-```bash
-git push
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-When Actions finishes, open **Releases** and download the portable apps.
-
----
-
-## More help
-
-- [User guide (EN)](docs/USER_GUIDE.en.md)
-- [用户指南（中文）](docs/USER_GUIDE.zh.md)
-
----
+This software is for learning and research only and is not investment advice. Assess risks yourself and follow Hyperliquid’s terms and local laws. The author is not liable for any losses from using this software.
 
 ## License
 
