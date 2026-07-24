@@ -15,7 +15,9 @@
 
 ## 运行演示
 
-<video src="./images/running.mp4" controls width="100%"></video>
+<p align="center">
+  <img src="./images/running.gif" alt="运行演示" width="100%" />
+</p>
 
 > 本程序可连接真实市场与真实资金，使用前请充分理解风险。建议先用 **模拟盘** 或 **测试网** 熟悉流程。
 

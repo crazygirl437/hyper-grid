@@ -15,7 +15,9 @@ Live account example:
 
 ## Demo
 
-<video src="./images/running.mp4" controls width="100%"></video>
+<p align="center">
+  <img src="./images/running.gif" alt="Demo" width="100%" />
+</p>
 
 > This app can connect to real markets with real funds. Understand the risks first. Prefer **Simulation** or **Testnet** before going live.
 
