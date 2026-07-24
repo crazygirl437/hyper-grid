@@ -185,10 +185,16 @@ impl HyperliquidExchange {
             .address
             .as_ref()
             .ok_or(ExchangeError::NotConnected)?;
-        let state = self
-            .post_info(json!({"type": "clearinghouseState", "user": addr}))
-            .await
-            .unwrap_or(json!({}));
+        let key = self.resolve_mid_key(symbol);
+        let state = if let Some(dex) = Self::dex_from_symbol(&key) {
+            self.post_info(json!({"type": "clearinghouseState", "user": addr, "dex": dex}))
+                .await
+                .unwrap_or(json!({}))
+        } else {
+            self.post_info(json!({"type": "clearinghouseState", "user": addr}))
+                .await
+                .unwrap_or(json!({}))
+        };
         let mut size = Decimal::ZERO;
         let mut entry = None;
         let mut upnl = None;
@@ -199,7 +205,7 @@ impl HyperliquidExchange {
                     None => continue,
                 };
                 let coin = pos.get("coin").and_then(|c| c.as_str()).unwrap_or("");
-                if !coin.eq_ignore_ascii_case(symbol) {
+                if !coin.eq_ignore_ascii_case(&key) && !coin.eq_ignore_ascii_case(symbol) {
                     continue;
                 }
                 size = pos
@@ -306,6 +312,51 @@ impl HyperliquidExchange {
             }
         }
 
+        // HIP-3: only load xyz (equity perps like SNDK/SKHY) to avoid rate limits.
+        if let Ok(dexs) = self.post_info(json!({"type": "perpDexs"})).await {
+            if let Some(arr) = dexs.as_array() {
+                for (dex_index, item) in arr.iter().enumerate() {
+                    let Some(dex_name) = item.get("name").and_then(|n| n.as_str()) else {
+                        continue; // index 0 is null = native perps
+                    };
+                    if dex_name != "xyz" {
+                        continue;
+                    }
+                    let Ok(meta) = self
+                        .post_info(json!({"type": "meta", "dex": dex_name}))
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) else {
+                        continue;
+                    };
+                    for (i, asset) in universe.iter().enumerate() {
+                        if asset.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
+                            continue;
+                        }
+                        let Some(name) = asset.get("name").and_then(|n| n.as_str()) else {
+                            continue;
+                        };
+                        let asset_id = 100_000u32 + (dex_index as u32) * 10_000 + i as u32;
+                        let decs = asset
+                            .get("szDecimals")
+                            .and_then(|d| d.as_u64())
+                            .unwrap_or(4) as u32;
+                        map.insert(name.to_string(), asset_id);
+                        sz_decimals.insert(name.to_string(), decs);
+                        if let Some((_, coin)) = name.split_once(':') {
+                            if !map.contains_key(coin) {
+                                aliases.insert(coin.to_string(), name.to_string());
+                                map.insert(coin.to_string(), asset_id);
+                                sz_decimals.insert(coin.to_string(), decs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let meta = self.post_info(json!({"type": "spotMeta"})).await?;
         let tokens: HashMap<u64, String> = meta
             .get("tokens")
@@ -351,6 +402,11 @@ impl HyperliquidExchange {
         self.mid_aliases = aliases;
         self.sz_decimals = sz_decimals;
         Ok(())
+    }
+
+    /// Builder DEX name from HIP-3 symbol (`xyz:SNDK` -> `xyz`).
+    fn dex_from_symbol(symbol: &str) -> Option<&str> {
+        symbol.split_once(':').map(|(dex, _)| dex)
     }
 
     fn resolve_mid_key(&self, symbol: &str) -> String {
@@ -791,22 +847,29 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn get_mid(&self, symbol: &str) -> ExchangeResult<Decimal> {
-        let mids = self.post_info(json!({"type": "allMids"})).await?;
+        let key = self.resolve_mid_key(symbol);
+        let body = if let Some(dex) = Self::dex_from_symbol(&key) {
+            json!({"type": "allMids", "dex": dex})
+        } else {
+            json!({"type": "allMids"})
+        };
+        let mids = self.post_info(body).await?;
         let obj = mids
             .as_object()
             .ok_or_else(|| ExchangeError::Api("allMids not object".into()))?;
-        // Exact key first (perp BTC, spot @50, PURR/USDC) so aliases cannot steal it.
-        if let Some(v) = obj.get(symbol).and_then(|x| x.as_str()) {
+        // Exact key first (perp BTC, HIP-3 xyz:SNDK, spot @50) so aliases cannot steal it.
+        if let Some(v) = obj.get(&key).and_then(|x| x.as_str()) {
             return Decimal::from_str(v).map_err(|e| ExchangeError::Api(e.to_string()));
         }
-        let key = self.resolve_mid_key(symbol);
         if key != symbol {
-            if let Some(v) = obj.get(&key).and_then(|x| x.as_str()) {
+            if let Some(v) = obj.get(symbol).and_then(|x| x.as_str()) {
                 return Decimal::from_str(v).map_err(|e| ExchangeError::Api(e.to_string()));
             }
         }
         for (k, v) in obj {
-            if k.eq_ignore_ascii_case(symbol) || k.eq_ignore_ascii_case(&format!("{symbol}/USDC"))
+            if k.eq_ignore_ascii_case(symbol)
+                || k.eq_ignore_ascii_case(&key)
+                || k.eq_ignore_ascii_case(&format!("{symbol}/USDC"))
             {
                 if let Some(s) = v.as_str() {
                     return Decimal::from_str(s).map_err(|e| ExchangeError::Api(e.to_string()));
@@ -1044,15 +1107,25 @@ impl Exchange for HyperliquidExchange {
                 return Ok(());
             }
         };
-        let open = self
-            .post_info(json!({"type": "openOrders", "user": addr}))
-            .await
-            .unwrap_or(json!([]));
+        let key = if symbol.is_empty() {
+            String::new()
+        } else {
+            self.resolve_mid_key(symbol)
+        };
+        let open = if let Some(dex) = Self::dex_from_symbol(&key) {
+            self.post_info(json!({"type": "openOrders", "user": &addr, "dex": dex}))
+                .await
+                .unwrap_or(json!([]))
+        } else {
+            self.post_info(json!({"type": "openOrders", "user": &addr}))
+                .await
+                .unwrap_or(json!([]))
+        };
         let mut cancels = Vec::new();
         if let Some(arr) = open.as_array() {
             for o in arr {
                 let coin = o.get("coin").and_then(|c| c.as_str()).unwrap_or("");
-                if !symbol.is_empty() && coin != symbol {
+                if !key.is_empty() && coin != key && coin != symbol {
                     continue;
                 }
                 let oid = match o.get("oid").and_then(|x| x.as_u64()) {
@@ -1068,7 +1141,7 @@ impl Exchange for HyperliquidExchange {
         }
         // Also include any locally tracked oids not returned yet.
         for order in self.open_orders.values() {
-            if !symbol.is_empty() && order.symbol != symbol {
+            if !key.is_empty() && order.symbol != symbol && order.symbol != key {
                 continue;
             }
             if let Some(oid_str) = &order.exchange_id {
@@ -1098,7 +1171,8 @@ impl Exchange for HyperliquidExchange {
         if symbol.is_empty() {
             self.open_orders.clear();
         } else {
-            self.open_orders.retain(|_, o| o.symbol != symbol);
+            self.open_orders
+                .retain(|_, o| o.symbol != symbol && o.symbol != key);
         }
         Ok(())
     }
@@ -1112,18 +1186,37 @@ impl Exchange for HyperliquidExchange {
             }
         };
 
-        // Fetch open orders + positions together (empty account = 2 quick GETs).
-        let open = self
-            .post_info(json!({"type": "openOrders", "user": addr}))
+        // Native + xyz (HIP-3) only — avoid hammering every builder DEX.
+        let mut order_sources = vec![self
+            .post_info(json!({"type": "openOrders", "user": &addr}))
             .await
-            .unwrap_or(json!([]));
-        let state = self
-            .post_info(json!({"type": "clearinghouseState", "user": addr}))
+            .unwrap_or(json!([]))];
+        let mut position_sources = vec![self
+            .post_info(json!({"type": "clearinghouseState", "user": &addr}))
             .await
-            .unwrap_or(json!({}));
+            .unwrap_or(json!({}))];
+        for dex in ["xyz"] {
+            order_sources.push(
+                self.post_info(json!({"type": "openOrders", "user": &addr, "dex": dex}))
+                    .await
+                    .unwrap_or(json!([])),
+            );
+            position_sources.push(
+                self.post_info(json!({
+                    "type": "clearinghouseState",
+                    "user": &addr,
+                    "dex": dex
+                }))
+                .await
+                .unwrap_or(json!({})),
+            );
+        }
 
         let mut cancels = Vec::new();
-        if let Some(arr) = open.as_array() {
+        for open in &order_sources {
+            let Some(arr) = open.as_array() else {
+                continue;
+            };
             for o in arr {
                 let coin = o.get("coin").and_then(|c| c.as_str()).unwrap_or("");
                 let oid = match o.get("oid").and_then(|x| x.as_u64()) {
@@ -1151,7 +1244,10 @@ impl Exchange for HyperliquidExchange {
         }
 
         let mut close_coins: Vec<(String, Decimal)> = Vec::new();
-        if let Some(positions) = state.get("assetPositions").and_then(|a| a.as_array()) {
+        for state in &position_sources {
+            let Some(positions) = state.get("assetPositions").and_then(|a| a.as_array()) else {
+                continue;
+            };
             for p in positions {
                 let pos = match p.get("position") {
                     Some(x) => x,
@@ -1166,7 +1262,9 @@ impl Exchange for HyperliquidExchange {
                 if szi == Decimal::ZERO || coin.is_empty() {
                     continue;
                 }
-                close_coins.push((coin.to_string(), szi));
+                if !close_coins.iter().any(|(c, _)| c == coin) {
+                    close_coins.push((coin.to_string(), szi));
+                }
             }
         }
 
@@ -1566,110 +1664,111 @@ pub async fn fetch_candles(
     Ok(out)
 }
 
-/// Build selectable market list with live mids.
+fn market_label(name: &str, dex: Option<&str>) -> String {
+    if let Some(dex_name) = dex {
+        let short = name.split_once(':').map(|(_, c)| c).unwrap_or(name);
+        format!("{short} ({dex_name})")
+    } else {
+        format!("{name} (perp)")
+    }
+}
+
+fn parse_market_leverage(item: &Value) -> (u32, bool) {
+    let max_lev = item
+        .get("maxLeverage")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as u32;
+    let only_isolated = item
+        .get("onlyIsolated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || item
+            .get("marginMode")
+            .and_then(|v| v.as_str())
+            .map(|m| m == "strictIsolated" || m == "noCross")
+            .unwrap_or(false);
+    (max_lev.max(1), only_isolated)
+}
+
+/// Collect markets from one `metaAndAssetCtxs` response, tagged with 24h notional volume.
+fn markets_from_asset_ctxs(raw: &Value, dex: Option<&str>) -> Vec<(Decimal, MarketInfo)> {
+    let Some(arr) = raw.as_array() else {
+        return Vec::new();
+    };
+    let Some(meta) = arr.first() else {
+        return Vec::new();
+    };
+    let Some(ctxs) = arr.get(1).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (item, ctx) in universe.iter().zip(ctxs.iter()) {
+        if item.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let mid = ctx
+            .get("midPx")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str(s).ok())
+            .filter(|m| *m > Decimal::ZERO);
+        let Some(mid) = mid else {
+            continue;
+        };
+        let volume = ctx
+            .get("dayNtlVlm")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str(s).ok())
+            .unwrap_or(Decimal::ZERO);
+        let (max_leverage, only_isolated) = parse_market_leverage(item);
+        out.push((
+            volume,
+            MarketInfo {
+                symbol: name.to_string(),
+                label: market_label(name, dex),
+                kind: "perp".into(),
+                mid,
+                min_leverage: 1,
+                max_leverage,
+                only_isolated,
+            },
+        ));
+    }
+    out
+}
+
+/// All native + xyz markets by 24h notional volume (2 API calls).
 pub async fn list_live_markets(mode: RunMode) -> ExchangeResult<Vec<MarketInfo>> {
     let mode = match mode {
         RunMode::Testnet => RunMode::Testnet,
-        _ => RunMode::Mainnet, // simulation + mainnet use mainnet catalog
+        _ => RunMode::Mainnet,
     };
-    let mut hl = HyperliquidExchange::new(mode);
-    hl.connect().await?;
-    let mids = hl.post_info(json!({"type": "allMids"})).await?;
-    let obj = mids
-        .as_object()
-        .ok_or_else(|| ExchangeError::Api("allMids not object".into()))?;
+    let hl = HyperliquidExchange::new(mode);
 
-    // Per-coin leverage limits from perpetual meta.
-    let mut lev_map: HashMap<String, (u32, bool)> = HashMap::new();
-    if let Ok(meta) = hl.post_info(json!({"type": "meta"})).await {
-        if let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) {
-            for item in universe {
-                let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
-                    continue;
-                };
-                if item.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
-                    continue;
-                }
-                let max_lev = item
-                    .get("maxLeverage")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as u32;
-                let only_isolated = item
-                    .get("onlyIsolated")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                    || item
-                        .get("marginMode")
-                        .and_then(|v| v.as_str())
-                        .map(|m| m == "strictIsolated" || m == "noCross")
-                        .unwrap_or(false);
-                lev_map.insert(name.to_string(), (max_lev.max(1), only_isolated));
-            }
-        }
+    let mut ranked: Vec<(Decimal, MarketInfo)> = Vec::new();
+    if let Ok(native) = hl.post_info(json!({"type": "metaAndAssetCtxs"})).await {
+        ranked.extend(markets_from_asset_ctxs(&native, None));
+    }
+    if let Ok(xyz) = hl
+        .post_info(json!({"type": "metaAndAssetCtxs", "dex": "xyz"}))
+        .await
+    {
+        ranked.extend(markets_from_asset_ctxs(&xyz, Some("xyz")));
     }
 
-    let preferred = [
-        "BTC", "ETH", "HYPE", "SOL", "BNB", "ARB", "OP", "DOGE", "AVAX", "LINK",
-    ];
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for coin in preferred {
-        if let Some(v) = obj.get(coin).and_then(|x| x.as_str()) {
-            if let Ok(mid) = Decimal::from_str(v) {
-                seen.insert(coin.to_string());
-                let (max_leverage, only_isolated) =
-                    lev_map.get(coin).copied().unwrap_or((50, false));
-                out.push(MarketInfo {
-                    symbol: coin.to_string(),
-                    label: format!("{coin} (perp)"),
-                    kind: "perp".into(),
-                    mid,
-                    min_leverage: 1,
-                    max_leverage,
-                    only_isolated,
-                });
-            }
-        }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.symbol.cmp(&b.1.symbol)));
+    let out: Vec<MarketInfo> = ranked.into_iter().map(|(_, m)| m).collect();
+    if out.is_empty() {
+        return Err(ExchangeError::Api("no markets from metaAndAssetCtxs".into()));
     }
-
-    // Other perp-like coins (no @/#)
-    let mut others: Vec<_> = obj
-        .keys()
-        .filter(|k| {
-            let key = k.as_str();
-            !key.starts_with('@')
-                && !key.starts_with('#')
-                && !key.contains('/')
-                && !seen.contains(key)
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-        .cloned()
-        .collect();
-    others.sort();
-    for coin in others.into_iter().take(80) {
-        if let Some(v) = obj.get(&coin).and_then(|x| x.as_str()) {
-            if let Ok(mid) = Decimal::from_str(v) {
-                let (max_leverage, only_isolated) =
-                    lev_map.get(&coin).copied().unwrap_or((50, false));
-                out.push(MarketInfo {
-                    symbol: coin.clone(),
-                    label: format!("{coin} (perp)"),
-                    kind: "perp".into(),
-                    mid,
-                    min_leverage: 1,
-                    max_leverage,
-                    only_isolated,
-                });
-            }
-        }
-    }
-
-    // Spot pairs omitted — product is perpetual grid.
-    let _ = &hl.mid_aliases;
-
     Ok(out)
 }
+
 
 #[cfg(test)]
 mod tests {

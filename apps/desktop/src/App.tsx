@@ -103,6 +103,9 @@ export default function App() {
   const [form, setForm] = useState(defaultForm);
   const [markets, setMarkets] = useState<MarketInfo[]>([]);
   const [marketsLoading, setMarketsLoading] = useState(false);
+  const [symbolQuery, setSymbolQuery] = useState("");
+  const [symbolOpen, setSymbolOpen] = useState(false);
+  const symbolComboRef = useRef<HTMLDivElement>(null);
   const [mid, setMid] = useState(0);
   const [midLoading, setMidLoading] = useState(false);
   const [levels, setLevels] = useState<GridLevel[]>([]);
@@ -226,6 +229,32 @@ export default function App() {
     const m = markets.find((x) => x.symbol === form.symbol);
     return marketLeverageBounds(m);
   }, [markets, form.symbol]);
+
+  const filteredMarkets = useMemo(() => {
+    const q = symbolQuery.trim().toLowerCase();
+    if (!q) return markets.slice(0, 20);
+    const needle = q.replace(/:/g, "");
+    return markets.filter((m) => {
+      const hay = `${m.symbol} ${m.label}`.toLowerCase();
+      return hay.includes(q) || hay.replace(/:/g, "").includes(needle);
+    });
+  }, [markets, symbolQuery]);
+
+  const selectedMarket = useMemo(
+    () => markets.find((m) => m.symbol === form.symbol),
+    [markets, form.symbol],
+  );
+
+  useEffect(() => {
+    if (!symbolOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!symbolComboRef.current?.contains(e.target as Node)) {
+        setSymbolOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [symbolOpen]);
 
   useEffect(() => {
     const { min, max, onlyIsolated } = leverageBounds;
@@ -813,24 +842,84 @@ export default function App() {
         <section className="panel grid-two">
           <div className="config-primary">
             <div className="market-card">
-              <label className="market-symbol">
+              <div className="market-symbol" ref={symbolComboRef}>
                 <span className="field-label">{t("app.symbol")}</span>
-                <select
-                  value={form.symbol}
-                  disabled={marketsLoading || markets.length === 0}
-                  onChange={(e) => void applySymbol(e.target.value)}
-                >
-                  {markets.length === 0 && <option value={form.symbol}>{form.symbol}</option>}
-                  {markets.map((m) => (
-                    <option key={`${m.kind}-${m.symbol}`} value={m.symbol}>
-                      {m.label} · {Number(m.mid).toLocaleString()}
-                    </option>
-                  ))}
-                </select>
+                <div className="symbol-combo">
+                  <button
+                    type="button"
+                    className="symbol-combo-trigger"
+                    disabled={marketsLoading || markets.length === 0}
+                    onClick={() => {
+                      setSymbolOpen((o) => !o);
+                      setSymbolQuery("");
+                    }}
+                  >
+                    <span>
+                      {selectedMarket
+                        ? `${selectedMarket.label} · ${Number(selectedMarket.mid).toLocaleString()}`
+                        : form.symbol || t("app.symbolSearch")}
+                    </span>
+                    <span className="symbol-combo-caret" aria-hidden>
+                      ▾
+                    </span>
+                  </button>
+                  {symbolOpen && (
+                    <div className="symbol-combo-panel">
+                      <input
+                        type="search"
+                        className="market-symbol-filter"
+                        value={symbolQuery}
+                        placeholder={t("app.symbolSearch")}
+                        autoFocus
+                        onChange={(e) => setSymbolQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") setSymbolOpen(false);
+                          if (e.key === "Enter" && filteredMarkets[0]) {
+                            void applySymbol(filteredMarkets[0].symbol);
+                            setSymbolOpen(false);
+                            setSymbolQuery("");
+                          }
+                        }}
+                      />
+                      <ul className="symbol-combo-list">
+                        {filteredMarkets.length === 0 && (
+                          <li className="symbol-combo-empty">{t("app.symbolNoMatch")}</li>
+                        )}
+                        {filteredMarkets.map((m) => (
+                          <li key={`${m.kind}-${m.symbol}`}>
+                            <button
+                              type="button"
+                              className={
+                                m.symbol === form.symbol
+                                  ? "symbol-combo-option symbol-combo-option-active"
+                                  : "symbol-combo-option"
+                              }
+                              onClick={() => {
+                                void applySymbol(m.symbol);
+                                setSymbolOpen(false);
+                                setSymbolQuery("");
+                              }}
+                            >
+                              <span>{m.label}</span>
+                              <span>{Number(m.mid).toLocaleString()}</span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
                 <small>
-                  {marketsLoading ? t("app.loadingMarkets") : t("app.symbolHelp")}
+                  {marketsLoading
+                    ? t("app.loadingMarkets")
+                    : symbolQuery.trim()
+                      ? t("app.symbolFilterHelp", {
+                          shown: filteredMarkets.length,
+                          count: markets.length,
+                        })
+                      : t("app.symbolHelp", { count: Math.min(20, markets.length) })}
                 </small>
-              </label>
+              </div>
 
               <div className="leverage-panel">
                 <div className="leverage-head">
