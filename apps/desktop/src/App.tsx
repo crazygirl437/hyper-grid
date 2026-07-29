@@ -266,8 +266,9 @@ export default function App() {
     });
   }, [leverageBounds]);
 
-  async function loadMarkets(preferredSymbol?: string) {
-    setMarketsLoading(true);
+  async function loadMarkets(preferredSymbol?: string, opts?: { silent?: boolean }) {
+    const silent = opts?.silent === true;
+    if (!silent) setMarketsLoading(true);
     const wantSymbol = preferredSymbol || form.symbol;
     try {
       const list = await api<MarketInfo[]>("list_markets");
@@ -295,9 +296,29 @@ export default function App() {
         }
       }
     } catch (e: any) {
-      setError(String(e));
+      if (!silent || markets.length === 0) setError(String(e));
     } finally {
-      setMarketsLoading(false);
+      if (!silent) setMarketsLoading(false);
+    }
+  }
+
+  async function refreshMarketMids() {
+    try {
+      const mids = await api<Record<string, string>>("list_market_mids");
+      setMarkets((prev) =>
+        prev.map((m) => {
+          const raw = mids[m.symbol];
+          const next = raw != null ? Number(raw) : Number.NaN;
+          return Number.isFinite(next) && next > 0 ? { ...m, mid: next } : m;
+        }),
+      );
+      const cur = mids[form.symbol];
+      if (cur != null) {
+        const midVal = Number(cur);
+        if (Number.isFinite(midVal) && midVal > 0) setMid(midVal);
+      }
+    } catch {
+      // Keep existing prices when rate-limited.
     }
   }
 
@@ -848,9 +869,16 @@ export default function App() {
                   <button
                     type="button"
                     className="symbol-combo-trigger"
-                    disabled={marketsLoading || markets.length === 0}
+                    disabled={marketsLoading && markets.length === 0}
                     onClick={() => {
-                      setSymbolOpen((o) => !o);
+                      setSymbolOpen((o) => {
+                        const next = !o;
+                        if (next) {
+                          if (markets.length > 0) void refreshMarketMids();
+                          else void loadMarkets(form.symbol, { silent: true });
+                        }
+                        return next;
+                      });
                       setSymbolQuery("");
                     }}
                   >

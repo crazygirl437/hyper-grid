@@ -1664,6 +1664,19 @@ pub async fn fetch_candles(
     Ok(out)
 }
 
+fn json_decimal(v: &Value) -> Option<Decimal> {
+    if let Some(s) = v.as_str() {
+        return Decimal::from_str(s).ok();
+    }
+    if let Some(n) = v.as_f64() {
+        return Decimal::from_str(&n.to_string()).ok();
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(Decimal::from(n));
+    }
+    None
+}
+
 fn market_label(name: &str, dex: Option<&str>) -> String {
     if let Some(dex_name) = dex {
         let short = name.split_once(':').map(|(_, c)| c).unwrap_or(name);
@@ -1714,16 +1727,15 @@ fn markets_from_asset_ctxs(raw: &Value, dex: Option<&str>) -> Vec<(Decimal, Mark
         };
         let mid = ctx
             .get("midPx")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Decimal::from_str(s).ok())
+            .and_then(json_decimal)
+            .or_else(|| ctx.get("markPx").and_then(json_decimal))
             .filter(|m| *m > Decimal::ZERO);
         let Some(mid) = mid else {
             continue;
         };
         let volume = ctx
             .get("dayNtlVlm")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Decimal::from_str(s).ok())
+            .and_then(json_decimal)
             .unwrap_or(Decimal::ZERO);
         let (max_leverage, only_isolated) = parse_market_leverage(item);
         out.push((
@@ -1742,7 +1754,86 @@ fn markets_from_asset_ctxs(raw: &Value, dex: Option<&str>) -> Vec<(Decimal, Mark
     out
 }
 
-/// All native + xyz markets by 24h notional volume (2 API calls).
+fn mids_from_all_mids(raw: &Value) -> HashMap<String, Decimal> {
+    let mut out = HashMap::new();
+    let Some(obj) = raw.as_object() else {
+        return out;
+    };
+    for (k, v) in obj {
+        if let Some(mid) = json_decimal(v).filter(|m| *m > Decimal::ZERO) {
+            out.insert(k.clone(), mid);
+        }
+    }
+    out
+}
+
+async fn post_info_retry(hl: &HyperliquidExchange, body: Value) -> ExchangeResult<Value> {
+    match hl.post_info(body.clone()).await {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            hl.post_info(body).await
+        }
+    }
+}
+
+/// Lightweight mid refresh for native + xyz (preferred for dropdown reopen).
+pub async fn list_live_mids(mode: RunMode) -> ExchangeResult<HashMap<String, Decimal>> {
+    let mode = match mode {
+        RunMode::Testnet => RunMode::Testnet,
+        _ => RunMode::Mainnet,
+    };
+    let hl = HyperliquidExchange::new(mode);
+    let mut out = HashMap::new();
+    if let Ok(native) = post_info_retry(&hl, json!({"type": "allMids"})).await {
+        out.extend(mids_from_all_mids(&native));
+    }
+    if let Ok(xyz) = post_info_retry(&hl, json!({"type": "allMids", "dex": "xyz"})).await {
+        out.extend(mids_from_all_mids(&xyz));
+    }
+    if out.is_empty() {
+        return Err(ExchangeError::Api("no mids from allMids".into()));
+    }
+    Ok(out)
+}
+
+fn markets_from_meta_and_mids(
+    meta: &Value,
+    mids: &HashMap<String, Decimal>,
+    dex: Option<&str>,
+) -> Vec<(Decimal, MarketInfo)> {
+    let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in universe {
+        if item.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(&mid) = mids.get(name) else {
+            continue;
+        };
+        let (max_leverage, only_isolated) = parse_market_leverage(item);
+        out.push((
+            Decimal::ZERO,
+            MarketInfo {
+                symbol: name.to_string(),
+                label: market_label(name, dex),
+                kind: "perp".into(),
+                mid,
+                min_leverage: 1,
+                max_leverage,
+                only_isolated,
+            },
+        ));
+    }
+    out
+}
+
+/// All native + xyz markets by 24h notional volume.
 pub async fn list_live_markets(mode: RunMode) -> ExchangeResult<Vec<MarketInfo>> {
     let mode = match mode {
         RunMode::Testnet => RunMode::Testnet,
@@ -1751,20 +1842,39 @@ pub async fn list_live_markets(mode: RunMode) -> ExchangeResult<Vec<MarketInfo>>
     let hl = HyperliquidExchange::new(mode);
 
     let mut ranked: Vec<(Decimal, MarketInfo)> = Vec::new();
-    if let Ok(native) = hl.post_info(json!({"type": "metaAndAssetCtxs"})).await {
-        ranked.extend(markets_from_asset_ctxs(&native, None));
+    let mut errors: Vec<String> = Vec::new();
+
+    match post_info_retry(&hl, json!({"type": "metaAndAssetCtxs"})).await {
+        Ok(native) => ranked.extend(markets_from_asset_ctxs(&native, None)),
+        Err(e) => errors.push(format!("native metaAndAssetCtxs: {e}")),
     }
-    if let Ok(xyz) = hl
-        .post_info(json!({"type": "metaAndAssetCtxs", "dex": "xyz"}))
-        .await
-    {
-        ranked.extend(markets_from_asset_ctxs(&xyz, Some("xyz")));
+    match post_info_retry(&hl, json!({"type": "metaAndAssetCtxs", "dex": "xyz"})).await {
+        Ok(xyz) => ranked.extend(markets_from_asset_ctxs(&xyz, Some("xyz"))),
+        Err(e) => errors.push(format!("xyz metaAndAssetCtxs: {e}")),
+    }
+
+    // Fallback when rate-limited / ctx endpoint empty: meta + allMids.
+    if ranked.is_empty() {
+        let mids = list_live_mids(mode).await.unwrap_or_default();
+        if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta"})).await {
+            ranked.extend(markets_from_meta_and_mids(&meta, &mids, None));
+        }
+        if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta", "dex": "xyz"})).await {
+            ranked.extend(markets_from_meta_and_mids(&meta, &mids, Some("xyz")));
+        }
     }
 
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.symbol.cmp(&b.1.symbol)));
     let out: Vec<MarketInfo> = ranked.into_iter().map(|(_, m)| m).collect();
     if out.is_empty() {
-        return Err(ExchangeError::Api("no markets from metaAndAssetCtxs".into()));
+        let detail = if errors.is_empty() {
+            "empty response".into()
+        } else {
+            errors.join("; ")
+        };
+        return Err(ExchangeError::Api(format!(
+            "no markets from metaAndAssetCtxs ({detail})"
+        )));
     }
     Ok(out)
 }
@@ -1906,5 +2016,6 @@ mod tests {
         assert_eq!(round_perp_price(dec!(65561.55), 5), dec!(65562));
         assert_eq!(round_perp_price(dec!(97000.55), 5), dec!(97001));
     }
+
 }
 

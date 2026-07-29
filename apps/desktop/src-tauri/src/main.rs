@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use exchange::{
-    fetch_candles, fetch_live_mid, list_live_markets, Candle, CandleInterval, Exchange,
+    fetch_candles, fetch_live_mid, list_live_markets, list_live_mids, Candle, CandleInterval, Exchange,
     HyperliquidExchange, MarketInfo, SimExchange,
 };
 use grid_engine::{
@@ -262,6 +262,18 @@ async fn list_markets(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<Mark
     list_live_markets(st.mode)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_market_mids(
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mode = state.lock().await.mode;
+    let mids = list_live_mids(mode).await.map_err(|e| e.to_string())?;
+    Ok(mids
+        .into_iter()
+        .map(|(k, v)| (k, v.normalize().to_string()))
+        .collect())
 }
 
 #[tauri::command]
@@ -999,6 +1011,7 @@ pub fn run() {
             get_account,
             list_symbols,
             list_markets,
+            list_market_mids,
             get_mid,
             get_candles,
             start_bot,
