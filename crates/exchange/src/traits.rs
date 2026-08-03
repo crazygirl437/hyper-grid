@@ -50,6 +50,15 @@ pub struct MarketInfo {
     /// "perp" or "spot"
     pub kind: String,
     pub mid: Decimal,
+    /// Current perpetual funding rate per funding interval (typically hourly).
+    #[serde(default)]
+    pub funding_rate: Option<Decimal>,
+    /// 24h notional volume in quote (USDC), when available from asset contexts.
+    #[serde(default)]
+    pub day_ntl_vlm: Option<Decimal>,
+    /// Previous day mid/mark price, used for 24h change estimates.
+    #[serde(default)]
+    pub prev_day_px: Option<Decimal>,
     /// Exchange min leverage (usually 1 for perps).
     #[serde(default = "default_min_leverage")]
     pub min_leverage: u32,
@@ -93,6 +102,9 @@ pub trait Exchange: Send + Sync {
 
     async fn cancel_all(&mut self, symbol: &str) -> ExchangeResult<()>;
 
+    /// Close only the net position for `symbol`, leaving other markets untouched.
+    async fn close_position(&mut self, symbol: &str) -> ExchangeResult<()>;
+
     /// Cancel all open orders and close all positions (account flatten).
     async fn flatten(&mut self) -> ExchangeResult<()> {
         self.cancel_all("").await?;
@@ -115,6 +127,9 @@ pub trait Exchange: Send + Sync {
                 kind: "unknown".into(),
                 symbol,
                 mid,
+                funding_rate: None,
+                day_ntl_vlm: None,
+                prev_day_px: None,
                 min_leverage: 1,
                 max_leverage: 50,
                 only_isolated: false,

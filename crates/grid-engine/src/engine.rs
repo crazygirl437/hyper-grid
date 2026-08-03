@@ -18,12 +18,30 @@ pub enum EngineEvent {
     Paused,
     Resumed,
     Stopped,
-    Halted { reason: String },
-    Breakout { price: Decimal },
-    OrderPlaced { order: LiveOrder },
-    OrderCanceled { client_id: String },
-    Filled { fill: FillEvent, realized_pnl: Decimal },
-    Message { text: String },
+    Halted {
+        reason: String,
+    },
+    Breakout {
+        price: Decimal,
+    },
+    ProtectiveExitRequested {
+        price: Decimal,
+        close_position: bool,
+        risk_triggered: bool,
+    },
+    OrderPlaced {
+        order: LiveOrder,
+    },
+    OrderCanceled {
+        client_id: String,
+    },
+    Filled {
+        fill: FillEvent,
+        realized_pnl: Decimal,
+    },
+    Message {
+        text: String,
+    },
 }
 
 pub struct GridEngine {
@@ -35,12 +53,21 @@ pub struct GridEngine {
     pub risk: RiskState,
     pub risk_cfg: RiskConfig,
     pub events: Vec<String>,
+    status_note: Option<String>,
     /// Net position (perp: signed; spot: long-only ≥ 0).
     position_base: Decimal,
     /// Volume-weighted average entry of current open position.
     avg_entry: Option<Decimal>,
     /// Exchange-reported unrealized PnL when available (overrides mid-mark estimate).
     exchange_unrealized: Option<Decimal>,
+    /// Net funding cash flow during this strategy session.
+    funding_pnl: Decimal,
+    /// Fills processed during this strategy session.
+    fill_count: usize,
+    /// Exchange-reported liquidation price (perps), when known.
+    liquidation_price: Option<Decimal>,
+    /// Initial maximum one-sided grid notional; replenishment must not exceed it.
+    max_position_notional: Decimal,
 }
 
 impl GridEngine {
@@ -61,9 +88,14 @@ impl GridEngine {
             risk: RiskState::new(starting_equity),
             risk_cfg,
             events: Vec::new(),
+            status_note: None,
             position_base: Decimal::ZERO,
             avg_entry: None,
             exchange_unrealized: None,
+            funding_pnl: Decimal::ZERO,
+            fill_count: 0,
+            liquidation_price: None,
+            max_position_notional: Decimal::ZERO,
         })
     }
 
@@ -94,6 +126,12 @@ impl GridEngine {
     /// - **Spot**: buys only below mid; sells appear after buys fill.
     pub fn bootstrap_intents(&mut self, mid_price: Decimal) -> GridResult<Vec<OrderIntent>> {
         self.ensure_not_halted()?;
+        if mid_price <= self.config.lower_price || mid_price >= self.config.upper_price {
+            return Err(GridError::InvalidConfig(format!(
+                "mid price {mid_price} must be inside grid range {}–{}",
+                self.config.lower_price, self.config.upper_price
+            )));
+        }
         self.mid_price = Some(mid_price);
         let levels = generate_levels(&self.config, mid_price)?;
         let intents: Vec<OrderIntent> = levels
@@ -111,7 +149,19 @@ impl GridEngine {
                 level_index: level.index,
             })
             .collect();
+        let buy_notional = intents
+            .iter()
+            .filter(|i| i.side == Side::Buy)
+            .map(|i| i.price * i.size)
+            .sum::<Decimal>();
+        let sell_notional = intents
+            .iter()
+            .filter(|i| i.side == Side::Sell)
+            .map(|i| i.price * i.size)
+            .sum::<Decimal>();
+        self.max_position_notional = buy_notional.max(sell_notional);
         self.status = BotStatus::Running;
+        self.status_note = None;
         let buys = intents.iter().filter(|i| i.side == Side::Buy).count();
         let sells = intents.iter().filter(|i| i.side == Side::Sell).count();
         self.push_event(format!(
@@ -153,17 +203,23 @@ impl GridEngine {
         None
     }
 
-    pub fn pause(&mut self) {
+    pub fn pause_with_reason(&mut self, reason: impl Into<String>) {
         if self.status == BotStatus::Running {
             self.status = BotStatus::Paused;
+            self.status_note = Some(reason.into());
             self.push_event("paused");
         }
+    }
+
+    pub fn pause(&mut self) {
+        self.pause_with_reason("manual pause");
     }
 
     pub fn resume(&mut self) -> GridResult<()> {
         self.ensure_not_halted()?;
         if self.status == BotStatus::Paused {
             self.status = BotStatus::Running;
+            self.status_note = None;
             self.push_event("resumed");
         }
         Ok(())
@@ -177,14 +233,38 @@ impl GridEngine {
             .collect();
         self.open_orders.clear();
         self.status = BotStatus::Idle;
+        self.status_note = None;
         self.push_event("stopped");
         ids
     }
 
     pub fn on_mid_price(&mut self, price: Decimal) -> Vec<EngineEvent> {
         self.mid_price = Some(price);
+        // Revalue against the latest mark instead of a stale exchange snapshot.
+        self.exchange_unrealized = None;
         let mut events = Vec::new();
         if self.status != BotStatus::Running {
+            return events;
+        }
+        let unrealized = self.unrealized_pnl();
+        self.risk
+            .on_strategy_equity(unrealized + self.funding_pnl, &self.risk_cfg);
+        if self.risk.halted {
+            let reason = self
+                .risk
+                .halt_reason
+                .clone()
+                .unwrap_or_else(|| "strategy equity risk limit reached".into());
+            self.status = BotStatus::ProtectiveExit;
+            self.push_event(format!("risk protective exit: {reason}"));
+            events.push(EngineEvent::Halted {
+                reason: reason.clone(),
+            });
+            events.push(EngineEvent::ProtectiveExitRequested {
+                price,
+                close_position: true,
+                risk_triggered: true,
+            });
             return events;
         }
         if price < self.config.lower_price || price > self.config.upper_price {
@@ -193,15 +273,33 @@ impl GridEngine {
             match self.config.breakout_action {
                 BreakoutAction::AlertOnly => {}
                 BreakoutAction::Pause => {
-                    self.pause();
+                    self.pause_with_reason(
+                        "breakout pause: replenishment stopped; orders and position retained",
+                    );
                     events.push(EngineEvent::Paused);
                 }
                 BreakoutAction::CancelAndPause => {
-                    self.open_orders.clear();
-                    self.pause();
-                    events.push(EngineEvent::Paused);
-                    events.push(EngineEvent::Message {
-                        text: "canceled open orders on breakout".into(),
+                    self.status = BotStatus::ProtectiveExit;
+                    self.status_note =
+                        Some("breakout stop: orders canceled; position retained".into());
+                    self.push_event("breakout protective exit: canceling symbol orders");
+                    events.push(EngineEvent::ProtectiveExitRequested {
+                        price,
+                        close_position: false,
+                        risk_triggered: false,
+                    });
+                }
+                BreakoutAction::CancelCloseAndStop => {
+                    self.status = BotStatus::ProtectiveExit;
+                    self.status_note =
+                        Some("breakout stop: orders canceled and position closed".into());
+                    self.push_event(
+                        "breakout protective exit: canceling orders and closing position",
+                    );
+                    events.push(EngineEvent::ProtectiveExitRequested {
+                        price,
+                        close_position: true,
+                        risk_triggered: false,
                     });
                 }
             }
@@ -209,10 +307,54 @@ impl GridEngine {
         events
     }
 
+    /// Mark exchange-confirmed cancellation while preserving the existing position.
+    pub fn mark_orders_canceled_and_paused(&mut self) {
+        self.open_orders.clear();
+        self.status = BotStatus::BreakoutStopped;
+        self.status_note = Some("breakout stop: orders canceled; position retained".into());
+        self.push_event(
+            "breakout protection complete: symbol orders canceled; position retained; fresh start required",
+        );
+    }
+
+    /// Mark exchange-confirmed cancellation and a flat position.
+    pub fn mark_breakout_stopped(&mut self) {
+        self.open_orders.clear();
+        self.position_base = Decimal::ZERO;
+        self.avg_entry = None;
+        self.exchange_unrealized = Some(Decimal::ZERO);
+        self.liquidation_price = None;
+        self.status = BotStatus::BreakoutStopped;
+        self.status_note = Some("breakout stop: orders canceled and position closed".into());
+        self.push_event("breakout protection complete: symbol orders canceled and position closed");
+    }
+
+    pub fn mark_risk_stopped(&mut self, reason: impl Into<String>) {
+        self.open_orders.clear();
+        self.position_base = Decimal::ZERO;
+        self.avg_entry = None;
+        self.liquidation_price = None;
+        self.exchange_unrealized = Some(Decimal::ZERO);
+        self.status = BotStatus::Halted;
+        self.status_note = Some(reason.into());
+        self.push_event(format!(
+            "risk protection complete: orders canceled and position closed ({})",
+            self.status_note.clone().unwrap_or_default()
+        ));
+    }
+
+    pub fn mark_protective_exit_failed(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.status = BotStatus::Halted;
+        self.status_note = Some(reason.clone());
+        self.push_event(format!("protective exit failed: {reason}"));
+    }
+
     /// Process a fill: update position; replenish only when the resting order is fully filled.
     pub fn on_fill(&mut self, fill: FillEvent) -> GridResult<(Decimal, Option<OrderIntent>)> {
         self.ensure_not_halted()?;
         let mut fully_filled = false;
+        let mut matched_order = false;
         // Replenish must use base-coin size, never USDC notional (size_per_level).
         let mut replenish_size = fill.size;
         if let Some(idx) = self
@@ -220,6 +362,7 @@ impl GridEngine {
             .iter()
             .position(|o| o.client_id == fill.client_id)
         {
+            matched_order = true;
             let level_size = self.open_orders[idx].level_size();
             let before = self.open_orders[idx].size;
             let remaining = before - fill.size;
@@ -236,11 +379,27 @@ impl GridEngine {
             Side::Buy => fill.size,
             Side::Sell => -fill.size,
         };
-        let realized = self.apply_position_delta(fill.price, signed);
+        let gross_realized = self.apply_position_delta(fill.price, signed);
+        let realized = gross_realized - fill.fee;
         // Local estimate until next exchange sync.
         self.exchange_unrealized = None;
+        self.fill_count += 1;
 
         self.risk.on_fill_pnl(realized, &self.risk_cfg);
+        let unrealized = self.unrealized_pnl();
+        self.risk
+            .on_strategy_equity(unrealized + self.funding_pnl, &self.risk_cfg);
+        let position_notional = self.position_base.abs() * fill.price;
+        let position_limit = self.max_position_notional * Decimal::new(102, 2);
+        if matched_order
+            && self.max_position_notional > Decimal::ZERO
+            && position_notional > position_limit
+        {
+            self.risk.force_halt(format!(
+                "position notional {position_notional} exceeds grid-side limit {}",
+                self.max_position_notional
+            ));
+        }
         self.push_event(format!(
             "filled {:?} {} @ {} realized={} pos={}",
             fill.side, fill.size, fill.price, realized, self.position_base
@@ -285,6 +444,7 @@ impl GridEngine {
         size: Decimal,
         entry: Option<Decimal>,
         unrealized: Option<Decimal>,
+        liquidation_price: Option<Decimal>,
     ) {
         let prev = self.position_base;
         let delta = (prev - size).abs();
@@ -292,18 +452,22 @@ impl GridEngine {
         if size == Decimal::ZERO {
             self.avg_entry = None;
             self.exchange_unrealized = Some(Decimal::ZERO);
+            self.liquidation_price = None;
         } else {
             if let Some(px) = entry {
                 self.avg_entry = Some(px);
             }
             self.exchange_unrealized = unrealized;
+            self.liquidation_price = liquidation_price.filter(|px| *px > Decimal::ZERO);
         }
         // Only log meaningful drifts (avoid spam on tiny rounding).
         if delta > Decimal::new(1, 6) {
-            self.push_event(format!(
-                "position synced from exchange: {prev} → {size}"
-            ));
+            self.push_event(format!("position synced from exchange: {prev} → {size}"));
         }
+    }
+
+    pub fn sync_funding_pnl(&mut self, funding_pnl: Decimal) {
+        self.funding_pnl = funding_pnl;
     }
 
     /// Apply signed size delta (+buy / −sell) with VWAP and realize PnL when reducing.
@@ -338,6 +502,7 @@ impl GridEngine {
         self.position_base = pos + signed_qty;
         if self.position_base == Decimal::ZERO {
             self.avg_entry = None;
+            self.liquidation_price = None;
         } else if (pos > Decimal::ZERO) != (self.position_base > Decimal::ZERO) {
             // Flipped: remainder opens at this fill price
             self.avg_entry = Some(price);
@@ -384,15 +549,19 @@ impl GridEngine {
         resting_orders.sort_by(|a, b| a.price.cmp(&b.price));
         BotSnapshot {
             status: self.status,
+            status_note: self.status_note.clone(),
             mode: self.mode,
             symbol: self.config.symbol.clone(),
             mid_price: self.mid_price,
             open_orders: self.open_orders.len(),
+            fill_count: self.fill_count,
             resting_orders,
             position_base: self.position_base.round_dp(8),
             avg_entry_price: self.avg_entry.map(|p| p.round_dp(8)),
+            liquidation_price: self.liquidation_price.map(|p| p.round_dp(8)),
             realized_pnl: self.risk.realized_pnl.round_dp(8),
             unrealized_pnl: self.unrealized_pnl().round_dp(8),
+            funding_pnl: self.funding_pnl.round_dp(8),
             events_tail: self.events.iter().rev().take(30).cloned().rev().collect(),
         }
     }
@@ -471,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn fill_fee_is_deducted_from_realized_pnl() {
+        let mut engine = GridEngine::new(sample_cfg(), RunMode::Simulation, dec!(1000)).unwrap();
+        engine.bootstrap_intents(dec!(95000)).unwrap();
+        let fill = FillEvent {
+            client_id: "fee-fill".into(),
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            price: dec!(95000),
+            size: dec!(0.001),
+            level_index: 2,
+            fee: dec!(0.25),
+        };
+
+        let (net_realized, _) = engine.on_fill(fill).unwrap();
+        assert_eq!(net_realized, dec!(-0.25));
+        assert_eq!(engine.snapshot().realized_pnl, dec!(-0.25));
+    }
+
+    #[test]
     fn buy_fill_replenishes_sell_above() {
         let mut cfg = sample_cfg();
         cfg.market = crate::MarketKind::Spot;
@@ -510,5 +698,47 @@ mod tests {
         engine.on_mid_price(buy_price + dec!(1000));
         let snap2 = engine.snapshot();
         assert!(snap2.unrealized_pnl > Decimal::ZERO);
+    }
+
+    #[test]
+    fn protective_breakout_requests_cancel_close_once() {
+        let mut cfg = sample_cfg();
+        cfg.breakout_action = BreakoutAction::CancelCloseAndStop;
+        let mut engine = GridEngine::new(cfg, RunMode::Simulation, dec!(1000)).unwrap();
+        engine.bootstrap_intents(dec!(95000)).unwrap();
+
+        let first = engine.on_mid_price(dec!(100001));
+        assert!(matches!(
+            first.as_slice(),
+            [
+                EngineEvent::Breakout { .. },
+                EngineEvent::ProtectiveExitRequested {
+                    close_position: true,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(engine.status, BotStatus::ProtectiveExit);
+        assert!(engine.on_mid_price(dec!(100002)).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_rejects_mid_outside_range() {
+        let mut engine = GridEngine::new(sample_cfg(), RunMode::Simulation, dec!(1000)).unwrap();
+        assert!(engine.bootstrap_intents(dec!(100001)).is_err());
+        assert_eq!(engine.status, BotStatus::Idle);
+    }
+
+    #[test]
+    fn breakout_stop_requires_fresh_start() {
+        let mut engine = GridEngine::new(sample_cfg(), RunMode::Simulation, dec!(1000)).unwrap();
+        engine.bootstrap_intents(dec!(95000)).unwrap();
+        engine.status = BotStatus::ProtectiveExit;
+        engine.mark_breakout_stopped();
+
+        assert_eq!(engine.status, BotStatus::BreakoutStopped);
+        engine.resume().unwrap();
+        assert_eq!(engine.status, BotStatus::BreakoutStopped);
+        assert!(engine.live_orders().is_empty());
     }
 }

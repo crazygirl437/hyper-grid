@@ -33,6 +33,20 @@ export type GridPreview = {
   size_per_level: string;
   estimated_quote_needed: string;
   estimated_base_needed: string;
+  max_loss_in_range: string;
+  max_loss_at: "lower" | "upper" | string;
+  estimated_margin: string;
+  worst_equity_isolated: string;
+  worst_margin_ratio_pct: string;
+  isolated_liquidation_risk: boolean;
+  cross_liq_risk_on_strategy_margin: boolean;
+  cross_liquidation_risk: boolean | null;
+  estimated_long_liq_price?: string | null;
+  estimated_short_liq_price?: string | null;
+  leverage: number;
+  is_cross: boolean;
+  assumed_mmr: string;
+  max_leverage?: number;
 };
 
 export type RestingOrder = {
@@ -43,15 +57,19 @@ export type RestingOrder = {
 
 export type BotSnapshot = {
   status: string;
+  status_note?: string | null;
   mode: string;
   symbol: string;
   mid_price: string | null;
   open_orders: number;
+  fill_count?: number;
   resting_orders?: RestingOrder[];
   position_base: string;
   avg_entry_price: string | null;
+  liquidation_price?: string | null;
   realized_pnl: string;
   unrealized_pnl: string;
+  funding_pnl: string;
   events_tail: string[];
 };
 
@@ -79,6 +97,7 @@ export type AppSettings = {
   is_cross: boolean;
   chart_mode: string;
   chart_interval: string;
+  range_pct?: string;
   env_path?: string;
 };
 

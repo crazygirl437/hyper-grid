@@ -180,11 +180,13 @@ impl HyperliquidExchange {
     pub async fn get_perp_position(
         &self,
         symbol: &str,
-    ) -> ExchangeResult<(Decimal, Option<Decimal>, Option<Decimal>)> {
-        let addr = self
-            .address
-            .as_ref()
-            .ok_or(ExchangeError::NotConnected)?;
+    ) -> ExchangeResult<(
+        Decimal,
+        Option<Decimal>,
+        Option<Decimal>,
+        Option<Decimal>,
+    )> {
+        let addr = self.address.as_ref().ok_or(ExchangeError::NotConnected)?;
         let key = self.resolve_mid_key(symbol);
         let state = if let Some(dex) = Self::dex_from_symbol(&key) {
             self.post_info(json!({"type": "clearinghouseState", "user": addr, "dex": dex}))
@@ -198,6 +200,7 @@ impl HyperliquidExchange {
         let mut size = Decimal::ZERO;
         let mut entry = None;
         let mut upnl = None;
+        let mut liquidation = None;
         if let Some(positions) = state.get("assetPositions").and_then(|a| a.as_array()) {
             for p in positions {
                 let pos = match p.get("position") {
@@ -222,10 +225,55 @@ impl HyperliquidExchange {
                     .get("unrealizedPnl")
                     .and_then(|s| s.as_str())
                     .and_then(|s| Decimal::from_str(s).ok());
+                liquidation = pos.get("liquidationPx").and_then(|s| {
+                    if s.is_null() {
+                        return None;
+                    }
+                    s.as_str()
+                        .and_then(|v| Decimal::from_str(v).ok())
+                        .or_else(|| s.as_f64().and_then(Decimal::from_f64_retain))
+                        .filter(|px| *px > Decimal::ZERO)
+                });
                 break;
             }
         }
-        Ok((size, entry, upnl))
+        Ok((size, entry, upnl, liquidation))
+    }
+
+    /// Net funding cash flow for this bot session. Negative means paid, positive received.
+    pub async fn get_session_funding_pnl(&self, symbol: &str) -> ExchangeResult<Decimal> {
+        let addr = self.address.as_ref().ok_or(ExchangeError::NotConnected)?;
+        let history = self
+            .post_info(json!({
+                "type": "userFunding",
+                "user": addr,
+                "startTime": self.session_start_ms,
+            }))
+            .await?;
+        Ok(funding_pnl_from_history(
+            &history,
+            symbol,
+            &self.resolve_mid_key(symbol),
+        ))
+    }
+
+    /// Query exchange state directly instead of trusting the local oid map.
+    pub async fn has_open_orders(&self, symbol: &str) -> ExchangeResult<bool> {
+        let addr = self.address.as_ref().ok_or(ExchangeError::NotConnected)?;
+        let key = self.resolve_mid_key(symbol);
+        let open = if let Some(dex) = Self::dex_from_symbol(&key) {
+            self.post_info(json!({"type": "openOrders", "user": addr, "dex": dex}))
+                .await?
+        } else {
+            self.post_info(json!({"type": "openOrders", "user": addr}))
+                .await?
+        };
+        Ok(open.as_array().is_some_and(|orders| {
+            orders.iter().any(|order| {
+                let coin = order.get("coin").and_then(|c| c.as_str()).unwrap_or("");
+                coin.eq_ignore_ascii_case(&key) || coin.eq_ignore_ascii_case(symbol)
+            })
+        }))
     }
 
     /// Seed fill dedupe from current exchange history so old trades are not
@@ -302,10 +350,8 @@ impl HyperliquidExchange {
                 for (i, item) in universe.iter().enumerate() {
                     if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                         map.insert(name.to_string(), i as u32);
-                        let decs = item
-                            .get("szDecimals")
-                            .and_then(|d| d.as_u64())
-                            .unwrap_or(4) as u32;
+                        let decs =
+                            item.get("szDecimals").and_then(|d| d.as_u64()).unwrap_or(4) as u32;
                         sz_decimals.insert(name.to_string(), decs);
                     }
                 }
@@ -435,7 +481,11 @@ impl HyperliquidExchange {
             .as_millis() as u64
     }
 
-    fn sign_l1_action(&self, action: &Value, nonce: u64) -> ExchangeResult<(String, String, String)> {
+    fn sign_l1_action(
+        &self,
+        action: &Value,
+        nonce: u64,
+    ) -> ExchangeResult<(String, String, String)> {
         let key_hex = self
             .private_key
             .as_ref()
@@ -794,7 +844,10 @@ fn parse_order_oid(resp: &Value) -> ExchangeResult<u64> {
     parse_order_status_item(status)
 }
 
-fn parse_batch_order_oids(resp: &Value, expected: usize) -> ExchangeResult<Vec<ExchangeResult<u64>>> {
+fn parse_batch_order_oids(
+    resp: &Value,
+    expected: usize,
+) -> ExchangeResult<Vec<ExchangeResult<u64>>> {
     let statuses = resp
         .pointer("/response/data/statuses")
         .and_then(|s| s.as_array())
@@ -880,10 +933,7 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn get_balances(&self) -> ExchangeResult<Vec<Balance>> {
-        let addr = self
-            .address
-            .as_ref()
-            .ok_or(ExchangeError::NotConnected)?;
+        let addr = self.address.as_ref().ok_or(ExchangeError::NotConnected)?;
         let mut out = Vec::new();
 
         let abstraction = self
@@ -893,10 +943,7 @@ impl Exchange for HyperliquidExchange {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "unknown".into());
 
-        let unified = matches!(
-            abstraction.as_str(),
-            "unifiedAccount" | "portfolioMargin"
-        );
+        let unified = matches!(abstraction.as_str(), "unifiedAccount" | "portfolioMargin");
 
         // Official docs: unified / portfolio margin balances live in spot clearinghouse.
         // Perp clearinghouse accountValue is often 0 and not meaningful.
@@ -1083,14 +1130,20 @@ impl Exchange for HyperliquidExchange {
     async fn cancel_order(&mut self, client_id: &str) -> ExchangeResult<()> {
         if let Some(order) = self.open_orders.get(client_id).cloned() {
             if let Some(oid_str) = &order.exchange_id {
-                if let Ok(oid) = oid_str.parse::<u64>() {
-                    if let Ok(asset) = self.resolve_asset(&order.symbol) {
-                        let action = json!({
-                            "type": "cancel",
-                            "cancels": [{"a": asset, "o": oid}]
-                        });
-                        let _ = self.post_exchange(action).await;
-                    }
+                let oid = oid_str.parse::<u64>().map_err(|_| {
+                    ExchangeError::Other(format!("invalid exchange order id {oid_str}"))
+                })?;
+                let asset = self.resolve_asset(&order.symbol)?;
+                let action = json!({
+                    "type": "cancel",
+                    "cancels": [{"a": asset, "o": oid}]
+                });
+                let resp = self.post_exchange(action).await?;
+                if resp.get("status").and_then(|s| s.as_str()) != Some("ok") {
+                    return Err(ExchangeError::Api(friendly_hl_error(
+                        &resp,
+                        self.address.as_deref(),
+                    )));
                 }
             }
         }
@@ -1165,7 +1218,10 @@ impl Exchange for HyperliquidExchange {
             });
             let resp = self.post_exchange(action).await?;
             if resp.get("status").and_then(|s| s.as_str()) != Some("ok") {
-                warn!("cancel_all response: {resp}");
+                return Err(ExchangeError::Api(friendly_hl_error(
+                    &resp,
+                    self.address.as_deref(),
+                )));
             }
         }
         if symbol.is_empty() {
@@ -1173,6 +1229,65 @@ impl Exchange for HyperliquidExchange {
         } else {
             self.open_orders
                 .retain(|_, o| o.symbol != symbol && o.symbol != key);
+        }
+        Ok(())
+    }
+
+    async fn close_position(&mut self, symbol: &str) -> ExchangeResult<()> {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            let (size, _, _, _) = self.get_perp_position(symbol).await?;
+            if size == Decimal::ZERO {
+                return Ok(());
+            }
+
+            let mid = self.get_mid(symbol).await?;
+            let sz_dec = *self.sz_decimals.get(symbol).unwrap_or(&4);
+            let abs_sz = size.abs().round_dp(sz_dec);
+            if abs_sz <= Decimal::ZERO {
+                return Err(ExchangeError::Other(format!(
+                    "position {size} for {symbol} is below tradable size precision"
+                )));
+            }
+            let (is_buy, raw_px) = if size > Decimal::ZERO {
+                (false, mid * dec!(0.95))
+            } else {
+                (true, mid * dec!(1.05))
+            };
+            let action = json!({
+                "type": "order",
+                "orders": [{
+                    "a": self.resolve_asset(symbol)?,
+                    "b": is_buy,
+                    "p": float_to_wire(round_perp_price(raw_px, sz_dec)),
+                    "s": float_to_wire(abs_sz),
+                    "r": true,
+                    "t": {"limit": {"tif": "Ioc"}}
+                }],
+                "grouping": "na"
+            });
+            let resp = self.post_exchange(action).await?;
+            if resp.get("status").and_then(|s| s.as_str()) != Some("ok") {
+                return Err(ExchangeError::Api(friendly_hl_error(
+                    &resp,
+                    self.address.as_deref(),
+                )));
+            }
+            let results = parse_batch_order_oids(&resp, 1)?;
+            if let Some(Err(e)) = results.into_iter().next() {
+                return Err(e);
+            }
+
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        let (remaining, _, _, _) = self.get_perp_position(symbol).await?;
+        if remaining != Decimal::ZERO {
+            return Err(ExchangeError::Other(format!(
+                "failed to fully close {symbol}; remaining position {remaining}"
+            )));
         }
         Ok(())
     }
@@ -1401,18 +1516,24 @@ impl Exchange for HyperliquidExchange {
                     .and_then(|p| p.as_str())
                     .and_then(|s| Decimal::from_str(s).ok())
                     .unwrap_or(Decimal::ZERO);
+                let fee = f
+                    .get("fee")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| Decimal::from_str(value).ok())
+                    .unwrap_or(Decimal::ZERO);
                 let oid = f
                     .get("oid")
                     .and_then(|o| o.as_u64().or_else(|| o.as_i64().map(|i| i as u64)))
                     .map(|o| o.to_string());
 
                 // Only attribute fills to our bot orders (match exchange oid).
-                let matched = self.open_orders.values().find(|o| {
-                    match (&oid, &o.exchange_id) {
+                let matched = self
+                    .open_orders
+                    .values()
+                    .find(|o| match (&oid, &o.exchange_id) {
                         (Some(fill_oid), Some(ex_id)) => fill_oid == ex_id,
                         _ => false,
-                    }
-                });
+                    });
                 let Some(order) = matched.cloned() else {
                     // If we still have tracked orders, this fill is external — ignore.
                     // If the map is empty (client was wiped), leave tid unseen so a
@@ -1453,7 +1574,7 @@ impl Exchange for HyperliquidExchange {
                     price: px,
                     size: sz,
                     level_index,
-                    fee: Decimal::ZERO,
+                    fee,
                 });
             }
         }
@@ -1597,6 +1718,10 @@ pub struct Candle {
 }
 
 /// Fetch OHLCV candles from Hyperliquid public `candleSnapshot` (no private key).
+///
+/// Does **not** call `connect()`/`refresh_spot_meta` — those burn several weight-20
+/// info calls per symbol and trip the IP 1200/min budget during screener scans.
+/// Perp symbols (incl. HIP-3 `dex:coin`) are passed through as the candle coin id.
 pub async fn fetch_candles(
     mode: RunMode,
     symbol: &str,
@@ -1607,10 +1732,17 @@ pub async fn fetch_candles(
         RunMode::Testnet => RunMode::Testnet,
         _ => RunMode::Mainnet,
     };
-    let mut hl = HyperliquidExchange::new(api_mode);
-    hl.connect().await?;
+    let hl = HyperliquidExchange::new(api_mode);
 
-    let coin = hl.resolve_candle_coin(symbol);
+    // Spot labels like "PURR/USDC" need @index from spotMeta; resolve once only then.
+    let coin = if symbol.contains('/') {
+        let mut primed = HyperliquidExchange::new(api_mode);
+        primed.refresh_spot_meta().await?;
+        primed.resolve_candle_coin(symbol)
+    } else {
+        symbol.trim().to_string()
+    };
+
     let bars = limit.clamp(1, 5000);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1677,6 +1809,22 @@ fn json_decimal(v: &Value) -> Option<Decimal> {
     None
 }
 
+fn funding_pnl_from_history(raw: &Value, symbol: &str, key: &str) -> Decimal {
+    raw.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("delta"))
+        .filter(|delta| {
+            let coin = delta
+                .get("coin")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            coin.eq_ignore_ascii_case(symbol) || coin.eq_ignore_ascii_case(key)
+        })
+        .filter_map(|delta| delta.get("usdc").and_then(json_decimal))
+        .fold(Decimal::ZERO, |sum, value| sum + value)
+}
+
 fn market_label(name: &str, dex: Option<&str>) -> String {
     if let Some(dex_name) = dex {
         let short = name.split_once(':').map(|(_, c)| c).unwrap_or(name);
@@ -1737,6 +1885,11 @@ fn markets_from_asset_ctxs(raw: &Value, dex: Option<&str>) -> Vec<(Decimal, Mark
             .get("dayNtlVlm")
             .and_then(json_decimal)
             .unwrap_or(Decimal::ZERO);
+        let funding_rate = ctx.get("funding").and_then(json_decimal);
+        let prev_day_px = ctx
+            .get("prevDayPx")
+            .and_then(json_decimal)
+            .filter(|p| *p > Decimal::ZERO);
         let (max_leverage, only_isolated) = parse_market_leverage(item);
         out.push((
             volume,
@@ -1745,6 +1898,9 @@ fn markets_from_asset_ctxs(raw: &Value, dex: Option<&str>) -> Vec<(Decimal, Mark
                 label: market_label(name, dex),
                 kind: "perp".into(),
                 mid,
+                funding_rate,
+                day_ntl_vlm: Some(volume),
+                prev_day_px,
                 min_leverage: 1,
                 max_leverage,
                 only_isolated,
@@ -1767,13 +1923,70 @@ fn mids_from_all_mids(raw: &Value) -> HashMap<String, Decimal> {
     out
 }
 
+fn is_rate_limited(err: &ExchangeError) -> bool {
+    match err {
+        ExchangeError::Api(s) => {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("429") || lower.contains("too many requests")
+        }
+        _ => false,
+    }
+}
+
 async fn post_info_retry(hl: &HyperliquidExchange, body: Value) -> ExchangeResult<Value> {
     match hl.post_info(body.clone()).await {
         Ok(v) => Ok(v),
-        Err(_) => {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+        Err(e) if is_rate_limited(&e) => {
+            // HL rate limits recover slowly; short retries make 429 worse.
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
             hl.post_info(body).await
         }
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            hl.post_info(body).await
+        }
+    }
+}
+
+struct MarketsCacheEntry {
+    mode: RunMode,
+    fetched_at: std::time::Instant,
+    markets: Vec<MarketInfo>,
+}
+
+fn markets_cache() -> &'static std::sync::Mutex<Option<MarketsCacheEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<MarketsCacheEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn markets_fetch_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+const MARKETS_TTL: Duration = Duration::from_secs(90);
+const MARKETS_STALE_MAX: Duration = Duration::from_secs(15 * 60);
+
+fn cached_markets(mode: RunMode, max_age: Duration) -> Option<Vec<MarketInfo>> {
+    let guard = markets_cache().lock().ok()?;
+    let entry = guard.as_ref()?;
+    if entry.mode != mode {
+        return None;
+    }
+    if entry.fetched_at.elapsed() > max_age {
+        return None;
+    }
+    Some(entry.markets.clone())
+}
+
+fn store_markets_cache(mode: RunMode, markets: Vec<MarketInfo>) {
+    if let Ok(mut guard) = markets_cache().lock() {
+        *guard = Some(MarketsCacheEntry {
+            mode,
+            fetched_at: std::time::Instant::now(),
+            markets,
+        });
     }
 }
 
@@ -1788,6 +2001,8 @@ pub async fn list_live_mids(mode: RunMode) -> ExchangeResult<HashMap<String, Dec
     if let Ok(native) = post_info_retry(&hl, json!({"type": "allMids"})).await {
         out.extend(mids_from_all_mids(&native));
     }
+    // Space requests — bursting native+xyz is a common 429 trigger.
+    tokio::time::sleep(Duration::from_millis(350)).await;
     if let Ok(xyz) = post_info_retry(&hl, json!({"type": "allMids", "dex": "xyz"})).await {
         out.extend(mids_from_all_mids(&xyz));
     }
@@ -1824,6 +2039,9 @@ fn markets_from_meta_and_mids(
                 label: market_label(name, dex),
                 kind: "perp".into(),
                 mid,
+                funding_rate: None,
+                day_ntl_vlm: None,
+                prev_day_px: None,
                 min_leverage: 1,
                 max_leverage,
                 only_isolated,
@@ -1834,39 +2052,79 @@ fn markets_from_meta_and_mids(
 }
 
 /// All native + xyz markets by 24h notional volume.
+///
+/// Results are cached (~90s). Concurrent callers coalesce on one fetch.
+/// On 429, returns a stale cache (up to 15m) instead of hammering fallbacks.
 pub async fn list_live_markets(mode: RunMode) -> ExchangeResult<Vec<MarketInfo>> {
     let mode = match mode {
         RunMode::Testnet => RunMode::Testnet,
         _ => RunMode::Mainnet,
     };
-    let hl = HyperliquidExchange::new(mode);
 
+    if let Some(cached) = cached_markets(mode, MARKETS_TTL) {
+        return Ok(cached);
+    }
+
+    let _guard = markets_fetch_lock().lock().await;
+    if let Some(cached) = cached_markets(mode, MARKETS_TTL) {
+        return Ok(cached);
+    }
+
+    let hl = HyperliquidExchange::new(mode);
     let mut ranked: Vec<(Decimal, MarketInfo)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut hit_rate_limit = false;
 
     match post_info_retry(&hl, json!({"type": "metaAndAssetCtxs"})).await {
         Ok(native) => ranked.extend(markets_from_asset_ctxs(&native, None)),
-        Err(e) => errors.push(format!("native metaAndAssetCtxs: {e}")),
-    }
-    match post_info_retry(&hl, json!({"type": "metaAndAssetCtxs", "dex": "xyz"})).await {
-        Ok(xyz) => ranked.extend(markets_from_asset_ctxs(&xyz, Some("xyz"))),
-        Err(e) => errors.push(format!("xyz metaAndAssetCtxs: {e}")),
+        Err(e) => {
+            hit_rate_limit |= is_rate_limited(&e);
+            errors.push(format!("native metaAndAssetCtxs: {e}"));
+        }
     }
 
-    // Fallback when rate-limited / ctx endpoint empty: meta + allMids.
-    if ranked.is_empty() {
-        let mids = list_live_mids(mode).await.unwrap_or_default();
-        if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta"})).await {
-            ranked.extend(markets_from_meta_and_mids(&meta, &mids, None));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    match post_info_retry(&hl, json!({"type": "metaAndAssetCtxs", "dex": "xyz"})).await {
+        Ok(xyz) => ranked.extend(markets_from_asset_ctxs(&xyz, Some("xyz"))),
+        Err(e) => {
+            hit_rate_limit |= is_rate_limited(&e);
+            errors.push(format!("xyz metaAndAssetCtxs: {e}"));
         }
-        if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta", "dex": "xyz"})).await {
-            ranked.extend(markets_from_meta_and_mids(&meta, &mids, Some("xyz")));
+    }
+
+    // Prefer stale cache over extra API calls when already rate-limited.
+    if ranked.is_empty() {
+        if let Some(stale) = cached_markets(mode, MARKETS_STALE_MAX) {
+            warn!("markets fetch failed ({}); serving stale cache", errors.join("; "));
+            return Ok(stale);
+        }
+    }
+
+    // Fallback when ctx endpoint empty — wait longer if we already saw 429.
+    if ranked.is_empty() {
+        if hit_rate_limit {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let mids = list_live_mids(mode).await.unwrap_or_default();
+        if !mids.is_empty() {
+            if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta"})).await {
+                ranked.extend(markets_from_meta_and_mids(&meta, &mids, None));
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if let Ok(meta) = post_info_retry(&hl, json!({"type": "meta", "dex": "xyz"})).await {
+                ranked.extend(markets_from_meta_and_mids(&meta, &mids, Some("xyz")));
+            }
         }
     }
 
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.symbol.cmp(&b.1.symbol)));
     let out: Vec<MarketInfo> = ranked.into_iter().map(|(_, m)| m).collect();
     if out.is_empty() {
+        if let Some(stale) = cached_markets(mode, MARKETS_STALE_MAX) {
+            warn!("markets empty after fallback; serving stale cache");
+            return Ok(stale);
+        }
         let detail = if errors.is_empty() {
             "empty response".into()
         } else {
@@ -1876,9 +2134,9 @@ pub async fn list_live_markets(mode: RunMode) -> ExchangeResult<Vec<MarketInfo>>
             "no markets from metaAndAssetCtxs ({detail})"
         )));
     }
+    store_markets_cache(mode, out.clone());
     Ok(out)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2017,5 +2275,40 @@ mod tests {
         assert_eq!(round_perp_price(dec!(97000.55), 5), dec!(97001));
     }
 
-}
+    #[test]
+    fn market_context_exposes_funding_rate() {
+        let raw = json!([
+            {
+                "universe": [
+                    {"name": "BTC", "maxLeverage": 40}
+                ]
+            },
+            [
+                {
+                    "midPx": "100000",
+                    "dayNtlVlm": "1000000",
+                    "funding": "0.0000125"
+                }
+            ]
+        ]);
 
+        let markets = markets_from_asset_ctxs(&raw, None);
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].1.funding_rate, Some(dec!(0.0000125)));
+        assert_eq!(markets[0].1.day_ntl_vlm, Some(dec!(1000000)));
+    }
+
+    #[test]
+    fn funding_history_sums_only_selected_symbol() {
+        let history = json!([
+            {"delta": {"coin": "BTC", "usdc": "-1.25"}},
+            {"delta": {"coin": "BTC", "usdc": "0.40"}},
+            {"delta": {"coin": "ETH", "usdc": "-9.00"}}
+        ]);
+
+        assert_eq!(
+            funding_pnl_from_history(&history, "BTC", "BTC"),
+            dec!(-0.85)
+        );
+    }
+}

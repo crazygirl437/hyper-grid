@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::Local;
 use directories::ProjectDirs;
 use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
@@ -52,6 +52,9 @@ pub struct AppConfig {
     pub chart_mode: String,
     #[serde(default = "default_chart_interval")]
     pub chart_interval: String,
+    /// Percent used by "fill range from mid" (±N%).
+    #[serde(default = "default_range_pct")]
+    pub range_pct: String,
 }
 
 fn default_mode() -> String {
@@ -70,7 +73,7 @@ fn default_spacing() -> String {
     "arithmetic".into()
 }
 fn default_breakout() -> String {
-    "pause".into()
+    "cancel_close_and_stop".into()
 }
 fn default_drawdown() -> String {
     "20".into()
@@ -92,6 +95,9 @@ fn default_chart_mode() -> String {
 }
 fn default_chart_interval() -> String {
     "15m".into()
+}
+fn default_range_pct() -> String {
+    "5".into()
 }
 
 impl Default for AppConfig {
@@ -115,6 +121,7 @@ impl Default for AppConfig {
             is_cross: default_cross(),
             chart_mode: default_chart_mode(),
             chart_interval: default_chart_interval(),
+            range_pct: default_range_pct(),
         }
     }
 }
@@ -124,10 +131,7 @@ impl AppConfig {
         vec![
             ("MODE".into(), self.mode.clone()),
             ("PRIVATE_KEY".into(), self.private_key.clone()),
-            (
-                "LANGUAGE".into(),
-                self.language.clone().unwrap_or_default(),
-            ),
+            ("LANGUAGE".into(), self.language.clone().unwrap_or_default()),
             ("SYMBOL".into(), self.symbol.clone()),
             ("LOWER_PRICE".into(), self.lower_price.clone()),
             ("UPPER_PRICE".into(), self.upper_price.clone()),
@@ -148,6 +152,7 @@ impl AppConfig {
             ),
             ("CHART_MODE".into(), self.chart_mode.clone()),
             ("CHART_INTERVAL".into(), self.chart_interval.clone()),
+            ("RANGE_PCT".into(), self.range_pct.clone()),
         ]
     }
 
@@ -191,6 +196,9 @@ impl AppConfig {
         }
         if self.chart_interval.is_empty() {
             self.chart_interval = default_chart_interval();
+        }
+        if self.range_pct.is_empty() {
+            self.range_pct = default_range_pct();
         }
     }
 }
@@ -311,7 +319,7 @@ impl Storage {
         self.db.execute(
             "INSERT INTO fills (ts, symbol, side, price, size, pnl, client_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
-                Utc::now().to_rfc3339(),
+                Local::now().to_rfc3339(),
                 symbol,
                 side,
                 price.to_string(),
@@ -326,7 +334,7 @@ impl Storage {
     pub fn record_event(&self, kind: &str, message: &str) -> Result<()> {
         self.db.execute(
             "INSERT INTO events (ts, kind, message) VALUES (?1,?2,?3)",
-            params![Utc::now().to_rfc3339(), kind, message],
+            params![Local::now().to_rfc3339(), kind, message],
         )?;
         Ok(())
     }
@@ -387,7 +395,7 @@ impl Storage {
     pub fn save_order_snapshot(&self, symbol: &str, payload: &str) -> Result<()> {
         self.db.execute(
             "INSERT INTO order_snapshots (ts, symbol, payload) VALUES (?1,?2,?3)",
-            params![Utc::now().to_rfc3339(), symbol, payload],
+            params![Local::now().to_rfc3339(), symbol, payload],
         )?;
         Ok(())
     }

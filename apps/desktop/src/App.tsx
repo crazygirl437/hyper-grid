@@ -13,15 +13,19 @@ import {
 } from "./lib/api";
 import { GridChart, ChartTrade, PricePoint } from "./components/GridChart";
 import { FlattenOverlay } from "./components/FlattenOverlay";
+import { PairScreener } from "./components/PairScreener";
 import i18n from "./i18n";
 
-type Tab = "account" | "configure" | "dashboard";
+type Tab = "account" | "configure" | "screener" | "dashboard";
 
 type MarketInfo = {
   symbol: string;
   label: string;
   kind: string;
   mid: string;
+  funding_rate?: string | null;
+  day_ntl_vlm?: string | null;
+  prev_day_px?: string | null;
   min_leverage?: number;
   max_leverage?: number;
   only_isolated?: boolean;
@@ -34,7 +38,7 @@ const defaultForm = {
   gridCount: 10,
   totalBudget: "1000",
   spacing: "arithmetic",
-  breakoutAction: "pause",
+  breakoutAction: "cancel_close_and_stop",
   maxDrawdownPct: "20",
   maxDailyLoss: "100",
   maxOrderFailures: 5,
@@ -42,12 +46,14 @@ const defaultForm = {
   isCross: true,
 };
 
-function suggestRange(mid: number) {
+function suggestRange(mid: number, pctPercent = 5) {
   if (!Number.isFinite(mid) || mid <= 0) {
     return { lower: "", upper: "" };
   }
-  const lower = mid * 0.95;
-  const upper = mid * 1.05;
+  const pct = Number.isFinite(pctPercent) ? Math.min(90, Math.max(0.1, pctPercent)) : 5;
+  const factor = pct / 100;
+  const lower = mid * (1 - factor);
+  const upper = mid * (1 + factor);
   const digits = mid >= 1000 ? 2 : mid >= 1 ? 4 : 6;
   return {
     lower: lower.toFixed(digits),
@@ -66,9 +72,19 @@ function clampLeverage(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+function formatFundingRate(value?: string | number | null) {
+  if (value === undefined || value === null || value === "") return "—";
+  const rate = Number(value);
+  if (!Number.isFinite(rate)) return "—";
+  const percent = rate * 100;
+  const sign = percent > 0 ? "+" : "";
+  return `${sign}${percent.toFixed(4)}% / 1h`;
+}
+
 export default function App() {
   const { t } = useTranslation();
   const [tab, setTab] = useState<Tab>("account");
+  const [screenerMounted, setScreenerMounted] = useState(false);
   const [mode, setMode] = useState("simulation");
   const [privateKey, setPrivateKey] = useState("");
   const [privateKeyDirty, setPrivateKeyDirty] = useState(false);
@@ -103,11 +119,13 @@ export default function App() {
   const [form, setForm] = useState(defaultForm);
   const [markets, setMarkets] = useState<MarketInfo[]>([]);
   const [marketsLoading, setMarketsLoading] = useState(false);
+  const marketsLoadGen = useRef(0);
   const [symbolQuery, setSymbolQuery] = useState("");
   const [symbolOpen, setSymbolOpen] = useState(false);
   const symbolComboRef = useRef<HTMLDivElement>(null);
   const [mid, setMid] = useState(0);
   const [midLoading, setMidLoading] = useState(false);
+  const [rangePct, setRangePct] = useState("5");
   const [levels, setLevels] = useState<GridLevel[]>([]);
   const [preview, setPreview] = useState<GridPreview | null>(null);
   const [status, setStatus] = useState<BotSnapshot | null>(null);
@@ -145,6 +163,7 @@ export default function App() {
       is_cross: form.isCross,
       chart_mode: chartMode,
       chart_interval: chartInterval,
+      range_pct: String(rangePctValue()),
     };
   }
 
@@ -159,7 +178,17 @@ export default function App() {
       console.warn("save_settings failed", e);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [privateKey, mode, form, chartMode, chartInterval]);
+  }, [privateKey, mode, form, chartMode, chartInterval, rangePct]);
+
+  function rangePctValue() {
+    const n = Number(rangePct);
+    return Number.isFinite(n) && n > 0 ? n : 5;
+  }
+
+  function applyRangeFromMid(midVal: number) {
+    const range = suggestRange(midVal, rangePctValue());
+    setForm((f) => ({ ...f, lowerPrice: range.lower, upperPrice: range.upper }));
+  }
 
   function pushPrice(value: number) {
     if (!Number.isFinite(value) || value <= 0) return;
@@ -225,6 +254,12 @@ export default function App() {
 
   const midNumber = useMemo(() => mid, [mid]);
 
+  const previewLiqRisk = preview
+    ? form.isCross
+      ? (preview.cross_liquidation_risk ?? preview.cross_liq_risk_on_strategy_margin)
+      : preview.isolated_liquidation_risk
+    : false;
+
   const leverageBounds = useMemo(() => {
     const m = markets.find((x) => x.symbol === form.symbol);
     return marketLeverageBounds(m);
@@ -268,10 +303,12 @@ export default function App() {
 
   async function loadMarkets(preferredSymbol?: string, opts?: { silent?: boolean }) {
     const silent = opts?.silent === true;
+    const gen = ++marketsLoadGen.current;
     if (!silent) setMarketsLoading(true);
     const wantSymbol = preferredSymbol || form.symbol;
     try {
       const list = await api<MarketInfo[]>("list_markets");
+      if (gen !== marketsLoadGen.current) return;
       setMarkets(list);
       if (list.length && !list.find((m) => m.symbol === wantSymbol)) {
         await applySymbol(list[0].symbol, Number(list[0].mid));
@@ -283,7 +320,7 @@ export default function App() {
           setForm((f) => {
             if (f.lowerPrice && f.upperPrice) return { ...f, symbol: wantSymbol };
             if (!f.lowerPrice || !f.upperPrice) {
-              const range = suggestRange(midVal);
+              const range = suggestRange(midVal, rangePctValue());
               return {
                 ...f,
                 symbol: wantSymbol,
@@ -296,9 +333,19 @@ export default function App() {
         }
       }
     } catch (e: any) {
-      if (!silent || markets.length === 0) setError(String(e));
+      if (gen !== marketsLoadGen.current) return;
+      const msg = String(e);
+      const rateLimited = /429|too many requests/i.test(msg);
+      // Keep existing list usable; don't spam a hard error on rate limits.
+      if (markets.length > 0 && (silent || rateLimited)) {
+        setTip(rateLimited ? t("app.marketsRateLimited") : msg);
+        return;
+      }
+      if (!silent || markets.length === 0) {
+        setError(rateLimited ? t("app.marketsRateLimited") : msg);
+      }
     } finally {
-      if (!silent) setMarketsLoading(false);
+      if (gen === marketsLoadGen.current && !silent) setMarketsLoading(false);
     }
   }
 
@@ -309,7 +356,9 @@ export default function App() {
         prev.map((m) => {
           const raw = mids[m.symbol];
           const next = raw != null ? Number(raw) : Number.NaN;
-          return Number.isFinite(next) && next > 0 ? { ...m, mid: next } : m;
+          return Number.isFinite(next) && next > 0
+            ? { ...m, mid: String(next) }
+            : m;
         }),
       );
       const cur = mids[form.symbol];
@@ -322,9 +371,20 @@ export default function App() {
     }
   }
 
-  async function applySymbol(symbol: string, knownMid?: number) {
+  async function applySymbol(
+    symbol: string,
+    knownMid?: number,
+    rangePctOverride?: number,
+  ) {
     const mkt = markets.find((x) => x.symbol === symbol);
     const bounds = marketLeverageBounds(mkt);
+    const pct =
+      rangePctOverride != null && Number.isFinite(rangePctOverride) && rangePctOverride > 0
+        ? Math.min(90, Math.max(0.1, rangePctOverride))
+        : rangePctValue();
+    if (rangePctOverride != null && Number.isFinite(rangePctOverride) && rangePctOverride > 0) {
+      setRangePct(String(pct));
+    }
     setForm((f) => ({
       ...f,
       symbol,
@@ -339,7 +399,7 @@ export default function App() {
       const midVal = Number(m);
       setMid(midVal);
       pushPrice(midVal);
-      const range = suggestRange(midVal);
+      const range = suggestRange(midVal, pct);
       setForm((f) => ({
         ...f,
         symbol,
@@ -377,7 +437,7 @@ export default function App() {
           gridCount: settings.grid_count || 10,
           totalBudget: settings.total_budget || "1000",
           spacing: settings.spacing || "arithmetic",
-          breakoutAction: settings.breakout_action || "pause",
+          breakoutAction: settings.breakout_action || "cancel_close_and_stop",
           maxDrawdownPct: settings.max_drawdown_pct || "20",
           maxDailyLoss: settings.max_daily_loss || "100",
           maxOrderFailures: settings.max_order_failures || 5,
@@ -391,6 +451,12 @@ export default function App() {
         if (["1m", "5m", "15m", "1h", "4h", "1d"].includes(iv)) {
           setChartInterval(iv);
         }
+        if (settings.range_pct != null && String(settings.range_pct).trim() !== "") {
+          const pct = Number(settings.range_pct);
+          if (Number.isFinite(pct) && pct > 0) {
+            setRangePct(String(settings.range_pct));
+          }
+        }
         const account = await api<any>("get_account");
         setMode(account.mode || settings.mode || "simulation");
         setAddress(account.address || "");
@@ -400,10 +466,10 @@ export default function App() {
         window.setTimeout(() => {
           skipNextPersist.current = false;
         }, 800);
-        // Markets/mid after form hydrated from .env
+        // Markets/mid after form hydrated from .env — delay past startup flatten traffic.
         window.setTimeout(() => {
           void loadMarkets(settings.symbol || "BTC");
-        }, 0);
+        }, 1500);
       } catch (e) {
         console.warn(e);
         settingsReady.current = true;
@@ -420,9 +486,8 @@ export default function App() {
     return () => window.clearTimeout(id);
   }, [persistSettings]);
 
-  useEffect(() => {
-    void loadMarkets();
-  }, [mode]);
+  // Markets are loaded after settings hydrate and when the user changes mode
+  // in the Account tab — avoid a second mount-time fetch that triggers 429.
 
   useEffect(() => {
     if (!form.symbol) return;
@@ -531,6 +596,13 @@ export default function App() {
     }
   }
 
+  function accountEquityUsdc(): string | undefined {
+    const usdc = balances.find((b) => b.asset.toUpperCase() === "USDC");
+    if (!usdc) return undefined;
+    const n = Number(usdc.total);
+    return Number.isFinite(n) && n > 0 ? String(n) : undefined;
+  }
+
   async function doPreview() {
     setError("");
     try {
@@ -538,6 +610,8 @@ export default function App() {
       const m = await api<string>("get_mid", { symbol: form.symbol });
       const midVal = Number(m);
       setMid(midVal);
+      const equity = accountEquityUsdc();
+      const maxLev = selectedMarket?.max_leverage;
       const p = await api<GridPreview>("preview_grid_cmd", {
         req: {
           symbol: form.symbol,
@@ -547,6 +621,10 @@ export default function App() {
           totalBudget: form.totalBudget,
           spacing: form.spacing,
           midPrice: String(midVal),
+          leverage: form.leverage,
+          isCross: form.isCross,
+          ...(equity ? { accountEquity: equity } : {}),
+          ...(maxLev ? { maxLeverage: maxLev } : {}),
         },
       });
       setPreview(p);
@@ -657,9 +735,65 @@ export default function App() {
       idle: "app.statusIdle",
       running: "app.statusRunning",
       paused: "app.statusPaused",
+      protective_exit: "app.statusProtectiveExit",
+      breakout_stopped: "app.statusBreakoutStopped",
       halted: "app.statusHalted",
     };
     return t(map[key] || "app.statusIdle");
+  }
+
+  function botStatusClass(raw?: string | null) {
+    const key = String(raw || "idle").toLowerCase();
+    if (key === "running") return "status-running";
+    if (key === "paused") return "status-paused";
+    if (key === "halted" || key === "protective_exit" || key === "breakout_stopped") {
+      return "status-halted";
+    }
+    return "status-idle";
+  }
+
+  function positionSideClass(position?: string | null) {
+    const p = Number(position ?? 0);
+    if (!Number.isFinite(p) || p === 0) return "pos-flat";
+    return p > 0 ? "pos-long" : "pos-short";
+  }
+
+  function botStatusNoteMeta(note?: string | null) {
+    if (!note) return null;
+    const map: Record<
+      string,
+      { key: string; tone: "neutral" | "warning" | "danger" }
+    > = {
+      "manual pause": { key: "app.statusNoteManualPause", tone: "neutral" },
+      "breakout pause: replenishment stopped; orders and position retained":
+        {
+          key: "app.statusNoteBreakoutPause",
+          tone: "neutral",
+        },
+      "breakout stop: orders canceled; position retained": {
+        key: "app.statusNoteBreakoutKeepPosition",
+        tone: "warning",
+      },
+      "breakout stop: orders canceled and position closed": {
+        key: "app.statusNoteBreakoutClosed",
+        tone: "warning",
+      },
+      "strategy equity risk limit reached": {
+        key: "app.statusNoteRiskStop",
+        tone: "danger",
+      },
+    };
+
+    const picked = map[note];
+    const text = t((picked?.key ?? note) as string);
+    const tone = picked?.tone ?? "neutral";
+    const className =
+      tone === "danger"
+        ? "metric-note-danger"
+        : tone === "warning"
+          ? "metric-note-warning"
+          : "";
+    return { text, className };
   }
 
   function fmtNum(v?: string | number | null, digits = 6) {
@@ -668,6 +802,21 @@ export default function App() {
     if (!Number.isFinite(n)) return String(v);
     if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
     return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+  }
+
+  function fmtLocalTime(raw?: string | null) {
+    if (!raw) return "—";
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return String(raw);
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
   }
 
   function pnlClass(v?: string | null) {
@@ -679,8 +828,13 @@ export default function App() {
   const totalPnl = (() => {
     const r = Number(status?.realized_pnl ?? 0);
     const u = Number(status?.unrealized_pnl ?? 0);
-    if (!Number.isFinite(r) && !Number.isFinite(u)) return "0";
-    return String((Number.isFinite(r) ? r : 0) + (Number.isFinite(u) ? u : 0));
+    const f = Number(status?.funding_pnl ?? 0);
+    if (!Number.isFinite(r) && !Number.isFinite(u) && !Number.isFinite(f)) return "0";
+    return String(
+      (Number.isFinite(r) ? r : 0) +
+        (Number.isFinite(u) ? u : 0) +
+        (Number.isFinite(f) ? f : 0),
+    );
   })();
 
   return (
@@ -690,12 +844,20 @@ export default function App() {
         <div className="top-left">
           <div className="brand">{t("app.title")}</div>
           <nav className="tabs">
-            {(["account", "configure", "dashboard"] as Tab[]).map((id) => (
+            {(["account", "configure", "screener", "dashboard"] as Tab[]).map((id) => (
               <button
                 key={id}
                 type="button"
                 className={tab === id ? "tab active" : "tab"}
-                onClick={() => setTab(id)}
+                onClick={() => {
+                  setTab(id);
+                  if (id === "screener") {
+                    setScreenerMounted(true);
+                    if (markets.length === 0) {
+                      void loadMarkets(form.symbol, { silent: true });
+                    }
+                  }
+                }}
               >
                 {t(`app.${id}`)}
               </button>
@@ -763,7 +925,7 @@ export default function App() {
                         // Keep saved band if already configured in .env.
                         setForm((f) => {
                           if (f.lowerPrice && f.upperPrice) return f;
-                          const range = suggestRange(midVal);
+                          const range = suggestRange(midVal, rangePctValue());
                           return {
                             ...f,
                             lowerPrice: range.lower,
@@ -937,16 +1099,37 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                <small>
-                  {marketsLoading
-                    ? t("app.loadingMarkets")
-                    : symbolQuery.trim()
-                      ? t("app.symbolFilterHelp", {
-                          shown: filteredMarkets.length,
-                          count: markets.length,
-                        })
-                      : t("app.symbolHelp", { count: Math.min(20, markets.length) })}
-                </small>
+                <div className="market-meta">
+                  <span className="market-meta-hint">
+                    {marketsLoading
+                      ? t("app.loadingMarkets")
+                      : symbolQuery.trim()
+                        ? t("app.symbolFilterHelp", {
+                            shown: filteredMarkets.length,
+                            count: markets.length,
+                          })
+                        : t("app.symbolHelp", { count: Math.min(20, markets.length) })}
+                  </span>
+                  {selectedMarket?.funding_rate != null && (
+                    <span
+                      className="market-funding"
+                      title={t("app.fundingRateHelp")}
+                    >
+                      <span className="market-funding-label">{t("app.fundingRate")}</span>
+                      <span
+                        className={
+                          Number(selectedMarket.funding_rate) > 0
+                            ? "market-funding-pos"
+                            : Number(selectedMarket.funding_rate) < 0
+                              ? "market-funding-neg"
+                              : undefined
+                        }
+                      >
+                        {formatFundingRate(selectedMarket.funding_rate)}
+                      </span>
+                    </span>
+                  )}
+                </div>
               </div>
 
               <div className="leverage-panel">
@@ -995,25 +1178,43 @@ export default function App() {
               </div>
 
               <div className="mid-panel">
-                <div className="mid-main">
-                  <span className="field-label">{t("app.liveMid")}</span>
+                <span className="field-label mid-label">{t("app.liveMid")}</span>
+                <div className="mid-row">
                   <strong className="mid-value">
                     {midLoading ? "…" : mid > 0 ? mid.toLocaleString() : "—"}
                   </strong>
-                </div>
-                <div className="mid-actions">
-                  <button type="button" className="ghost" onClick={() => void refreshMid()}>
-                    {t("app.refreshPrice")}
-                  </button>
                   <button
                     type="button"
-                    className="ghost"
-                    onClick={() => {
-                      const range = suggestRange(mid);
-                      setForm((f) => ({ ...f, lowerPrice: range.lower, upperPrice: range.upper }));
-                    }}
+                    className="mid-action"
+                    onClick={() => void refreshMid()}
+                    disabled={midLoading}
+                    aria-label={t("app.refreshPrice")}
                   >
-                    {t("app.fitRange")}
+                    <span className="mid-action-icon" aria-hidden>
+                      ↻
+                    </span>
+                    {t("app.refreshPrice")}
+                  </button>
+                </div>
+                <div className="fit-range-row">
+                  <span className="fit-range-prefix">{t("app.fitRangePrefix")}</span>
+                  <input
+                    type="number"
+                    className="fit-range-input"
+                    min={0}
+                    max={90}
+                    step={0.5}
+                    value={rangePct}
+                    onChange={(e) => setRangePct(e.target.value)}
+                    aria-label={t("app.fitRangePct")}
+                  />
+                  <span className="fit-range-suffix">%</span>
+                  <button
+                    type="button"
+                    className="mid-action"
+                    onClick={() => applyRangeFromMid(mid)}
+                  >
+                    {t("app.fitRangeApply")}
                   </button>
                 </div>
               </div>
@@ -1060,18 +1261,63 @@ export default function App() {
               </button>
             </div>
             {preview && (
-              <p className="hint">
-                {t("app.previewSummary", {
-                  buys: preview.buy_count,
-                  sells: preview.sell_count,
-                  quote: Number(preview.estimated_quote_needed).toLocaleString(undefined, {
-                    maximumFractionDigits: 2,
-                  }),
-                  base: Number(preview.estimated_base_needed).toLocaleString(undefined, {
-                    maximumFractionDigits: 6,
-                  }),
-                })}
-              </p>
+              <div className="preview-risk">
+                <p className="hint">
+                  {t("app.previewSummary", {
+                    buys: preview.buy_count,
+                    sells: preview.sell_count,
+                  })}
+                </p>
+                <p className="hint">
+                  {t(
+                    preview.max_loss_at === "long_liq" || preview.max_loss_at === "short_liq"
+                      ? "app.previewMaxLossLiq"
+                      : "app.previewMaxLoss",
+                    {
+                      loss: Number(preview.max_loss_in_range).toLocaleString(undefined, {
+                        maximumFractionDigits: 2,
+                      }),
+                      margin: Number(preview.estimated_margin).toLocaleString(undefined, {
+                        maximumFractionDigits: 2,
+                      }),
+                    },
+                  )}
+                </p>
+                <p className={previewLiqRisk ? "hint preview-risk-bad" : "hint preview-risk-ok"}>
+                  {(() => {
+                    const risk = previewLiqRisk ? t("app.previewLiqYes") : t("app.previewLiqNo");
+                    const longLiq = Number(preview.estimated_long_liq_price);
+                    const shortLiq = Number(preview.estimated_short_liq_price);
+                    const lower = Number(form.lowerPrice);
+                    const upper = Number(form.upperPrice);
+                    const longInRange =
+                      Number.isFinite(longLiq) &&
+                      Number.isFinite(lower) &&
+                      longLiq > lower &&
+                      longLiq < upper;
+                    const shortInRange =
+                      Number.isFinite(shortLiq) &&
+                      Number.isFinite(upper) &&
+                      shortLiq < upper &&
+                      shortLiq > lower;
+                    if (previewLiqRisk && shortInRange) {
+                      return t("app.previewLiqDetail", {
+                        risk,
+                        side: t("app.previewLiqSideShort"),
+                        liq: shortLiq.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+                      });
+                    }
+                    if (previewLiqRisk && longInRange) {
+                      return t("app.previewLiqDetail", {
+                        risk,
+                        side: t("app.previewLiqSideLong"),
+                        liq: longLiq.toLocaleString(undefined, { maximumFractionDigits: 2 }),
+                      });
+                    }
+                    return t("app.previewLiq", { risk });
+                  })()}
+                </p>
+              </div>
             )}
           </div>
           <div className="config-chart-col">
@@ -1122,8 +1368,9 @@ export default function App() {
                     onChange={(e) => setForm({ ...form, breakoutAction: e.target.value })}
                   >
                     <option value="alert_only">{t("app.alertOnly")}</option>
-                    <option value="pause">{t("app.pause")}</option>
-                    <option value="cancel_and_pause">{t("app.cancelAndPause")}</option>
+                    <option value="pause">{t("app.breakoutPause")}</option>
+                    <option value="cancel_and_pause">{t("app.cancelOrdersKeepPosition")}</option>
+                    <option value="cancel_close_and_stop">{t("app.cancelCloseAndStop")}</option>
                   </select>
                 </label>
                 <label>
@@ -1219,51 +1466,127 @@ export default function App() {
         </section>
       )}
 
+      {screenerMounted && (
+        <div
+          className={tab === "screener" ? undefined : "tab-panel-hidden"}
+          aria-hidden={tab !== "screener"}
+        >
+          <PairScreener
+            markets={markets}
+            loading={marketsLoading}
+            currentSymbol={form.symbol}
+            onRefresh={() => void loadMarkets(form.symbol, { silent: false })}
+            onUse={(symbol, knownMid, suggestedRangePct) => {
+              void (async () => {
+                await applySymbol(symbol, knownMid, suggestedRangePct);
+                setTip(
+                  suggestedRangePct != null
+                    ? t("app.screenerAppliedWithRange", {
+                        symbol,
+                        pct: suggestedRangePct,
+                      })
+                    : t("app.screenerApplied", { symbol }),
+                );
+                setTab("configure");
+              })();
+            }}
+          />
+        </div>
+      )}
+
       {tab === "dashboard" && (
         <section className="panel">
           <div className="stats">
-            <div>
-              <span className="stat-label">{t("app.status")}</span>
-              <span className="stat-value">{botStatusLabel(status?.status)}</span>
+            <div className="metric-group">
+              <span className="metric-group-title">{t("app.runtimeMetrics")}</span>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.status")}</span>
+                <span className={`stat-value ${botStatusClass(status?.status)}`}>
+                  {botStatusLabel(status?.status)}
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.openOrders")}</span>
+                <span className="stat-value">{status?.open_orders ?? 0}</span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.fillCount")}</span>
+                <span className="stat-value">{status?.fill_count ?? 0}</span>
+              </div>
+              {(() => {
+                const meta = botStatusNoteMeta(status?.status_note);
+                if (!meta) return null;
+                return (
+                  <div className={`metric-note ${meta.className}`}>{meta.text}</div>
+                );
+              })()}
             </div>
-            <div>
-              <span className="stat-label">{t("app.midPrice")}</span>
-              <span className="stat-value">{fmtNum(status?.mid_price, 4)}</span>
+
+            <div className="metric-group">
+              <span className="metric-group-title">{t("app.positionMetrics")}</span>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.position")}</span>
+                <span className={`stat-value ${positionSideClass(status?.position_base)}`}>
+                  {(() => {
+                    const p = Number(status?.position_base ?? 0);
+                    if (!Number.isFinite(p) || p === 0)
+                      return `0 ${status?.symbol || form.symbol}`;
+                    const side = p > 0 ? t("app.legendBuy") : t("app.legendSell");
+                    return `${side} ${fmtNum(Math.abs(p))}`;
+                  })()}
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.avgEntry")}</span>
+                <span className="stat-value">{fmtNum(status?.avg_entry_price, 4)}</span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.liquidationPrice")}</span>
+                <span className="stat-value">
+                  {status?.liquidation_price != null &&
+                  Number(status.liquidation_price) > 0
+                    ? fmtNum(status.liquidation_price, 4)
+                    : "—"}
+                </span>
+              </div>
             </div>
-            <div>
-              <span className="stat-label">{t("app.position")}</span>
-              <span className="stat-value">
-                {(() => {
-                  const p = Number(status?.position_base ?? 0);
-                  if (!Number.isFinite(p) || p === 0) return `0 ${status?.symbol || form.symbol}`;
-                  const side = p > 0 ? t("app.legendBuy") : t("app.legendSell");
-                  return `${side} ${fmtNum(Math.abs(p))} ${status?.symbol || form.symbol}`;
-                })()}
-              </span>
+
+            <div className="metric-group">
+              <span className="metric-group-title">{t("app.pnlMetrics")}</span>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.realizedPnl")}</span>
+                <span className={`stat-value ${pnlClass(status?.realized_pnl)}`}>
+                  {fmtNum(status?.realized_pnl, 4)}
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.unrealizedPnl")}</span>
+                <span className={`stat-value ${pnlClass(status?.unrealized_pnl)}`}>
+                  {fmtNum(status?.unrealized_pnl, 4)}
+                </span>
+              </div>
+              <div className="metric-item metric-total">
+                <span className="stat-label">{t("app.totalPnl")}</span>
+                <span className={`stat-value ${pnlClass(totalPnl)}`}>
+                  {fmtNum(totalPnl, 4)}
+                </span>
+              </div>
             </div>
-            <div>
-              <span className="stat-label">{t("app.avgEntry")}</span>
-              <span className="stat-value">{fmtNum(status?.avg_entry_price, 4)}</span>
-            </div>
-            <div>
-              <span className="stat-label">{t("app.openOrders")}</span>
-              <span className="stat-value">{status?.open_orders ?? 0}</span>
-            </div>
-            <div>
-              <span className="stat-label">{t("app.realizedPnl")}</span>
-              <span className={`stat-value ${pnlClass(status?.realized_pnl)}`}>
-                {fmtNum(status?.realized_pnl, 4)}
-              </span>
-            </div>
-            <div>
-              <span className="stat-label">{t("app.unrealizedPnl")}</span>
-              <span className={`stat-value ${pnlClass(status?.unrealized_pnl)}`}>
-                {fmtNum(status?.unrealized_pnl, 4)}
-              </span>
-            </div>
-            <div>
-              <span className="stat-label">{t("app.totalPnl")}</span>
-              <span className={`stat-value ${pnlClass(totalPnl)}`}>{fmtNum(totalPnl, 4)}</span>
+
+            <div className="metric-group">
+              <span className="metric-group-title">{t("app.fundingMetrics")}</span>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.fundingRate")}</span>
+                <span className="stat-value">
+                  {formatFundingRate(selectedMarket?.funding_rate)}
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.fundingPnl")}</span>
+                <span className={`stat-value ${pnlClass(status?.funding_pnl)}`}>
+                  {fmtNum(status?.funding_pnl, 6)} USDC
+                </span>
+              </div>
             </div>
           </div>
           <GridChart
@@ -1293,6 +1616,7 @@ export default function App() {
             <button
               type="button"
               className="btn-ok"
+              disabled={String(status?.status || "").toLowerCase() !== "paused"}
               onClick={async () => {
                 setStatus(await api<BotSnapshot>("resume_bot"));
               }}
@@ -1347,7 +1671,7 @@ export default function App() {
             ))}
             {events.map((e, i) => (
               <li key={`ev-${i}`}>
-                [{e.ts}] {e.kind}: {e.message}
+                [{fmtLocalTime(e.ts)}] {e.kind}: {e.message}
               </li>
             ))}
           </ul>
@@ -1358,7 +1682,7 @@ export default function App() {
             {fills.length === 0 && <li>{t("app.noFills")}</li>}
             {fills.map((f, i) => (
               <li key={i}>
-                {f.ts} {f.side} {f.size}@{f.price} pnl={f.pnl}
+                {fmtLocalTime(f.ts)} {f.side} {f.size}@{f.price} pnl={f.pnl}
               </li>
             ))}
           </ul>

@@ -186,6 +186,7 @@ pub fn apply_env_map(cfg: &mut AppConfig, map: &BTreeMap<String, String>) {
     take!(is_cross, "IS_CROSS", bool);
     take!(chart_mode, "CHART_MODE");
     take!(chart_interval, "CHART_INTERVAL");
+    take!(range_pct, "RANGE_PCT");
 }
 
 #[cfg(test)]
@@ -204,6 +205,7 @@ mod tests {
         cfg.grid_count = 12;
         cfg.is_cross = false;
         cfg.language = Some("zh-CN".into());
+        cfg.range_pct = "10.5".into();
         write_env_file(&path, &cfg).unwrap();
         let map = load_env_file(&path).unwrap();
         let mut loaded = AppConfig::default();
@@ -214,6 +216,7 @@ mod tests {
         assert_eq!(loaded.grid_count, 12);
         assert!(!loaded.is_cross);
         assert_eq!(loaded.language.as_deref(), Some("zh-CN"));
+        assert_eq!(loaded.range_pct, "10.5");
     }
 
     #[test]

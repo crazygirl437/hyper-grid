@@ -9,6 +9,7 @@ import {
   LineData,
   LineStyle,
   SeriesMarker,
+  TickMarkType,
   Time,
 } from "lightweight-charts";
 import type { Candle, ChartInterval, ChartMode, GridLevel, RestingOrder } from "../lib/api";
@@ -46,6 +47,60 @@ type Props = {
 
 function toTime(sec: number): Time {
   return Math.max(1, Math.floor(sec)) as Time;
+}
+
+/** Convert chart Time (UTC unix seconds or business day) to a Date in local wall clock. */
+function timeToLocalDate(time: Time): Date | null {
+  if (typeof time === "number") {
+    return new Date(time * 1000);
+  }
+  if (typeof time === "string") {
+    const d = new Date(time);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (time && typeof time === "object" && "year" in time) {
+    return new Date(time.year, time.month - 1, time.day);
+  }
+  return null;
+}
+
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+/** Crosshair / tooltip label: local timezone. */
+function formatLocalTimeLabel(time: Time, locale?: string): string {
+  const d = timeToLocalDate(time);
+  if (!d) return "";
+  return d.toLocaleString(locale, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+/** Axis tick marks: local timezone (library defaults to UTC). */
+function formatLocalTickMark(time: Time, tickMarkType: TickMarkType, locale?: string): string {
+  const d = timeToLocalDate(time);
+  if (!d) return "";
+  switch (tickMarkType) {
+    case TickMarkType.Year:
+      return String(d.getFullYear());
+    case TickMarkType.Month:
+      return d.toLocaleString(locale, { month: "short", year: "2-digit" });
+    case TickMarkType.DayOfMonth:
+      return d.toLocaleString(locale, { month: "short", day: "numeric" });
+    case TickMarkType.Time:
+      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    case TickMarkType.TimeWithSeconds:
+      return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    default:
+      return formatLocalTimeLabel(time, locale);
+  }
 }
 
 function applyMidToLast(bars: CandlestickData[], mid: number): CandlestickData[] {
@@ -201,6 +256,7 @@ export function GridChart({
 
   useEffect(() => {
     if (!ref.current) return;
+    const locale = i18n.language || undefined;
     const chart = createChart(ref.current, {
       height,
       layout: {
@@ -212,10 +268,16 @@ export function GridChart({
         horzLines: { color: "#f3f4f6" },
       },
       rightPriceScale: { borderVisible: false },
+      localization: {
+        locale,
+        timeFormatter: (time: Time) => formatLocalTimeLabel(time, locale || undefined),
+      },
       timeScale: {
         borderVisible: false,
         timeVisible: true,
         secondsVisible: mode === "line",
+        tickMarkFormatter: (time, tickMarkType) =>
+          formatLocalTickMark(time, tickMarkType, locale || undefined),
       },
     });
 
@@ -252,7 +314,7 @@ export function GridChart({
       seriesRef.current = null;
       linesRef.current = [];
     };
-  }, [height, mode]);
+  }, [height, mode, i18n.language]);
 
   useEffect(() => {
     const series = seriesRef.current;

@@ -31,7 +31,12 @@ pub struct SimExchange {
 }
 
 impl SimExchange {
-    pub fn new(symbol: impl Into<String>, start_mid: Decimal, quote: Decimal, base: Decimal) -> Self {
+    pub fn new(
+        symbol: impl Into<String>,
+        start_mid: Decimal,
+        quote: Decimal,
+        base: Decimal,
+    ) -> Self {
         let pad = (start_mid * dec!(0.05)).max(dec!(0.01));
         Self::with_band(
             symbol,
@@ -90,13 +95,22 @@ impl SimExchange {
         self.state.lock().await.mid
     }
 
+    pub async fn position_size(&self) -> Decimal {
+        *self.base_balance.lock().await
+    }
+
     async fn advance_mid(&self) -> Decimal {
         let mut st = self.state.lock().await;
         st.tick = st.tick.wrapping_add(1);
 
         let mid_f = st.mid.to_string().parse::<f64>().unwrap_or(0.0);
         let center_f = st.center.to_string().parse::<f64>().unwrap_or(mid_f);
-        let amp_f = st.amplitude.to_string().parse::<f64>().unwrap_or(1.0).max(1e-9);
+        let amp_f = st
+            .amplitude
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(1.0)
+            .max(1e-9);
         let lo_f = st.lower.to_string().parse::<f64>().unwrap_or(mid_f);
         let hi_f = st.upper.to_string().parse::<f64>().unwrap_or(mid_f);
         let range = (hi_f - lo_f).max(1e-9);
@@ -139,9 +153,7 @@ impl SimExchange {
         next += rng.gen_range(-0.0008..0.0008) * range;
 
         let next_d = Decimal::from_f64_retain(next).unwrap_or(st.mid);
-        st.mid = next_d
-            .clamp(st.lower, st.upper)
-            .round_dp(6);
+        st.mid = next_d.clamp(st.lower, st.upper).round_dp(6);
         st.mid
     }
 
@@ -266,6 +278,13 @@ impl Exchange for SimExchange {
         Ok(())
     }
 
+    async fn close_position(&mut self, symbol: &str) -> ExchangeResult<()> {
+        if symbol == self.symbol {
+            *self.base_balance.lock().await = Decimal::ZERO;
+        }
+        Ok(())
+    }
+
     async fn flatten(&mut self) -> ExchangeResult<()> {
         self.orders.lock().await.clear();
         *self.base_balance.lock().await = Decimal::ZERO;
@@ -307,5 +326,42 @@ impl SimExchange {
     pub async fn set_mid_async(&self, mid: Decimal) {
         let mut st = self.state.lock().await;
         st.mid = mid.clamp(st.lower, st.upper);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn symbol_protection_cancels_only_target_and_closes_position() {
+        let mut sim = SimExchange::new("BTC", dec!(100), dec!(1000), dec!(2));
+        sim.place_order(OrderIntent {
+            client_id: "btc-order".into(),
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            price: dec!(90),
+            size: dec!(1),
+            level_index: 0,
+        })
+        .await
+        .unwrap();
+        sim.place_order(OrderIntent {
+            client_id: "eth-order".into(),
+            symbol: "ETH".into(),
+            side: Side::Sell,
+            price: dec!(110),
+            size: dec!(1),
+            level_index: 1,
+        })
+        .await
+        .unwrap();
+
+        sim.cancel_all("BTC").await.unwrap();
+        sim.close_position("BTC").await.unwrap();
+
+        assert!(sim.list_open_orders("BTC").await.unwrap().is_empty());
+        assert_eq!(sim.list_open_orders("ETH").await.unwrap().len(), 1);
+        assert_eq!(sim.position_size().await, Decimal::ZERO);
     }
 }

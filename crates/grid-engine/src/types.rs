@@ -40,6 +40,8 @@ pub enum BreakoutAction {
     AlertOnly,
     Pause,
     CancelAndPause,
+    /// Cancel this strategy's symbol orders, close its position, and require a fresh start.
+    CancelCloseAndStop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +50,8 @@ pub enum BotStatus {
     Idle,
     Running,
     Paused,
+    ProtectiveExit,
+    BreakoutStopped,
     Halted,
 }
 
@@ -221,10 +225,15 @@ pub struct RestingOrderView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotSnapshot {
     pub status: BotStatus,
+    #[serde(default)]
+    pub status_note: Option<String>,
     pub mode: RunMode,
     pub symbol: String,
     pub mid_price: Option<Decimal>,
     pub open_orders: usize,
+    /// Fills processed during this strategy session.
+    #[serde(default)]
+    pub fill_count: usize,
     /// Live resting orders for chart price lines.
     #[serde(default)]
     pub resting_orders: Vec<RestingOrderView>,
@@ -232,8 +241,14 @@ pub struct BotSnapshot {
     pub position_base: Decimal,
     /// Average entry price of current long inventory, if any.
     pub avg_entry_price: Option<Decimal>,
+    /// Exchange-reported liquidation price when available (perps).
+    #[serde(default)]
+    pub liquidation_price: Option<Decimal>,
     pub realized_pnl: Decimal,
     /// Mark-to-mid unrealized PnL on open position.
     pub unrealized_pnl: Decimal,
+    /// Net funding cash flow for this strategy session (negative paid, positive received).
+    #[serde(default)]
+    pub funding_pnl: Decimal,
     pub events_tail: Vec<String>,
 }
