@@ -127,16 +127,16 @@ fn default_range_pct() -> String {
     "5".into()
 }
 fn default_grid_mode() -> String {
-    "fixed".into()
+    "dynamic".into()
 }
 fn default_atr_interval() -> String {
-    "15m".into()
+    "1h".into()
 }
 fn default_atr_period() -> u32 {
     14
 }
 fn default_atr_mult() -> String {
-    "1.25".into()
+    "5".into()
 }
 fn default_confirm_bars() -> u32 {
     2

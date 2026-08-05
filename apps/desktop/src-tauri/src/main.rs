@@ -225,7 +225,7 @@ async fn estimate_dynamic_bounds(
         .filter(|s| !s.trim().is_empty())
         .map(dec)
         .transpose()?
-        .unwrap_or_else(|| Decimal::new(125, 2)); // 1.25
+        .unwrap_or_else(|| Decimal::from(5));
     let mut config = GridConfig {
         symbol: req.symbol.clone(),
         lower_price: Decimal::ZERO,
@@ -1086,7 +1086,7 @@ fn default_schema_version() -> u32 {
     2
 }
 fn default_grid_mode_export() -> String {
-    "fixed".into()
+    "dynamic".into()
 }
 
 #[tauri::command]

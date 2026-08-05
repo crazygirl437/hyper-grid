@@ -94,12 +94,12 @@ You can also set spacing (arithmetic / geometric), margin mode (cross / isolated
 | Spacing | Arithmetic / geometric |
 | Margin mode | Cross / isolated |
 | Leverage | Amplifies both gain and loss |
-| Grid mode | **Fixed**: manual bounds; **Dynamic**: ATR band, optional soft recenter with position kept (`GRID_MODE`) |
-| ATR candle interval | Candle interval for ATR, e.g. `15m` / `1h` (`ATR_INTERVAL`) |
+| Grid mode | **Dynamic** (default): ATR band, optional soft recenter with position kept; **Fixed**: manual bounds (`GRID_MODE`) |
+| ATR candle interval | Candle interval for ATR, default `1h` (`ATR_INTERVAL`) |
 | ATR period | ATR lookback bars, default 14 (`ATR_PERIOD`) |
-| ATR multiplier | Half-width ≈ ATR% × mult, clamped ~2%–12% (`ATR_MULT`) |
-| Breakout confirm bars | Closed candles outside the band before recenter / breakout action (`CONFIRM_BARS`) |
-| Recenter cooldown / max per day | Limits how often dynamic grids may migrate |
+| ATR multiplier | Half-width ≈ ATR% × mult, default `5`, clamped ~2%–12% (`ATR_MULT`) |
+| Breakout confirm bars | Closed candles outside the band before recenter / breakout action, default 2 (`CONFIRM_BARS`) |
+| Recenter cooldown / max per day | Limits how often dynamic grids may migrate (default 3600s / 4 per day) |
 | On breakout | Fixed: pause / cancel-stop, etc.; dynamic defaults to **recenter (keep position)** |
 | Max drawdown / daily loss | Circuit breaker; cancel and flatten |
 | Max consecutive order failures | Halt after this many failures (`MAX_ORDER_FAILURES`) |
