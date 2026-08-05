@@ -79,7 +79,7 @@ Testnet / Mainnet require a private key before start. Never share it.
 2. **Configure grid** — symbol, range, levels, size, leverage → **Preview** → **Start**.
 3. **Run panel** — watch status, PnL, and fills; **Pause / Resume / Stop** as needed (Stop cancels and flattens).
 
-You can also set spacing (arithmetic / geometric), margin mode (cross / isolated), breakout behavior, max drawdown, and daily loss; import / export strategy configs is supported.
+You can also set spacing (arithmetic / geometric), margin mode (cross / isolated), fixed / dynamic grid, breakout behavior, max drawdown, and daily loss; import / export strategy configs is supported. The PnL analytics tab shows all-session totals and equity curves.
 
 ## Common settings
 
@@ -87,19 +87,32 @@ You can also set spacing (arithmetic / geometric), margin mode (cross / isolated
 |------|------|
 | Run mode | **Simulation** (no real funds) / **Testnet** / **Mainnet** |
 | Symbol | Hyperliquid perps (e.g. BTC); not spot grids |
-| Lower / upper price | Price band covered by the grid |
+| Lower / upper price | Grid band; in dynamic mode filled from ATR (refreshable) |
+| Fit range from mid % | Quick ±N% band around live mid (`RANGE_PCT`) |
 | Grid levels | Number of layers in the band (start with defaults) |
 | Total notional | Planned notional in USDC; too little per level blocks start |
+| Spacing | Arithmetic / geometric |
+| Margin mode | Cross / isolated |
 | Leverage | Amplifies both gain and loss |
-| On breakout | Alert only / Pause / Cancel & pause |
-| Max drawdown / daily loss | Circuit breaker; stops new orders |
+| Grid mode | **Fixed**: manual bounds; **Dynamic**: ATR band, optional soft recenter with position kept (`GRID_MODE`) |
+| ATR candle interval | Candle interval for ATR, e.g. `15m` / `1h` (`ATR_INTERVAL`) |
+| ATR period | ATR lookback bars, default 14 (`ATR_PERIOD`) |
+| ATR multiplier | Half-width ≈ ATR% × mult, clamped ~2%–12% (`ATR_MULT`) |
+| Breakout confirm bars | Closed candles outside the band before recenter / breakout action (`CONFIRM_BARS`) |
+| Recenter cooldown / max per day | Limits how often dynamic grids may migrate |
+| On breakout | Fixed: pause / cancel-stop, etc.; dynamic defaults to **recenter (keep position)** |
+| Max drawdown / daily loss | Circuit breaker; cancel and flatten |
+| Max consecutive order failures | Halt after this many failures (`MAX_ORDER_FAILURES`) |
+| Auto-start on launch | Start from saved config if no resumable session (`AUTO_START`) |
+| Resume on restart | Restore open session state when possible (`RESUME_ON_RESTART`) |
+| Close-window policy | Default **preserve** exchange orders/position (`EXIT_POLICY=preserve`); **Stop** cancels and flattens the strategy symbol |
 
 ## Safety
 
 - Crypto and perps are risky; you can lose money — higher leverage means higher risk.
 - Keep the private key on this machine only; never send it to anyone or upload it.
 - Practice on Simulation / Testnet first; start small on mainnet.
-- On Stop, quit, or restart, the app tries to cancel orders and flatten — watch fees and positions.
+- **Stop** cancels and flattens the strategy symbol; closing the window by default **preserves** exchange orders/position (resumable) — watch fees and positions.
 
 ## Disclaimer
 
