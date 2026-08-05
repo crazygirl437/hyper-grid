@@ -41,16 +41,16 @@ const defaultForm = {
   gridCount: 10,
   totalBudget: "1000",
   spacing: "arithmetic",
-  breakoutAction: "cancel_close_and_stop",
+  breakoutAction: "recenter",
   maxDrawdownPct: "20",
   maxDailyLoss: "100",
   maxOrderFailures: 5,
   leverage: 5,
   isCross: true,
-  gridMode: "fixed" as "fixed" | "dynamic",
-  atrInterval: "15m",
+  gridMode: "dynamic" as "fixed" | "dynamic",
+  atrInterval: "1h",
   atrPeriod: 14,
-  atrMult: "1.25",
+  atrMult: "5",
   confirmBars: 2,
   recenterCooldownSecs: 3600,
   maxRecentersPerDay: 4,
@@ -501,10 +501,10 @@ export default function App() {
           maxOrderFailures: settings.max_order_failures || 5,
           leverage: settings.leverage || 5,
           isCross: settings.is_cross !== false,
-          gridMode: settings.grid_mode === "dynamic" ? "dynamic" : "fixed",
-          atrInterval: settings.atr_interval || "15m",
+          gridMode: settings.grid_mode === "fixed" ? "fixed" : "dynamic",
+          atrInterval: settings.atr_interval || "1h",
           atrPeriod: settings.atr_period || 14,
-          atrMult: settings.atr_mult || "1.25",
+          atrMult: settings.atr_mult || "5",
           confirmBars: settings.confirm_bars || 2,
           recenterCooldownSecs: settings.recenter_cooldown_secs || 3600,
           maxRecentersPerDay: settings.max_recenters_per_day || 4,
@@ -540,7 +540,7 @@ export default function App() {
         // AUTO_START: if no resumable session already running, start with saved config.
         if (settings.auto_start && !autoStartAttempted.current) {
           autoStartAttempted.current = true;
-          const gridMode = settings.grid_mode === "dynamic" ? "dynamic" : "fixed";
+          const gridMode = settings.grid_mode === "fixed" ? "fixed" : "dynamic";
           window.setTimeout(() => {
             void (async () => {
               try {
@@ -577,9 +577,9 @@ export default function App() {
                     leverage: settings.leverage || 5,
                     isCross: settings.is_cross !== false,
                     gridMode,
-                    atrInterval: settings.atr_interval || "15m",
+                    atrInterval: settings.atr_interval || "1h",
                     atrPeriod: settings.atr_period || 14,
-                    atrMult: settings.atr_mult || "1.25",
+                    atrMult: settings.atr_mult || "5",
                     confirmBars: settings.confirm_bars || 2,
                     recenterCooldownSecs: settings.recenter_cooldown_secs || 3600,
                     maxRecentersPerDay: settings.max_recenters_per_day || 4,

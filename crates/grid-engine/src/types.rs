@@ -75,8 +75,8 @@ pub enum MarketKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GridMode {
-    #[default]
     Fixed,
+    #[default]
     Dynamic,
 }
 
@@ -118,13 +118,13 @@ pub struct DynamicGridConfig {
 }
 
 fn default_atr_interval() -> String {
-    "15m".into()
+    "1h".into()
 }
 fn default_atr_period() -> u32 {
     14
 }
 fn default_atr_mult() -> Decimal {
-    dec!(1.25)
+    dec!(5)
 }
 fn default_min_half_width() -> Decimal {
     dec!(2)

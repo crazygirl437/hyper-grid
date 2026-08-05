@@ -1306,23 +1306,49 @@ pub async fn recover_session(app: &AppHandle, st: &mut AppState) -> Result<(), S
 }
 
 /// Persist detached state on window close — no cancel/flatten.
+/// Skips revival after manual Stop / Halt so the next launch does not auto-resume.
 pub fn detach_on_exit(st: &mut AppState) {
     st.running_task = false;
-    if let Some(engine) = st.engine.as_mut() {
-        engine.mark_detached(
-            "app closed: exchange orders and position retained; software risk offline",
-        );
-        persist_checkpoint(&st.storage, engine, "detached");
-        let _ = st.storage.record_event(
-            "detach",
-            "window closed; orders and position preserved on exchange",
-        );
+    let Some(engine) = st.engine.as_mut() else {
+        return;
+    };
+    let status = engine.snapshot().status;
+    // After Stop the engine is Idle; after risk/breakout it may be Halted / BreakoutStopped.
+    // Do not upsert active=1 or the next launch will "resume" a session the user already stopped.
+    if matches!(
+        status,
+        BotStatus::Idle
+            | BotStatus::Halted
+            | BotStatus::BreakoutStopped
+            | BotStatus::ProtectiveExit
+    ) {
+        let sid = engine.session_id().to_string();
+        let payload = engine.checkpoint_payload();
+        let final_status = match status {
+            BotStatus::Idle => "stopped".to_string(),
+            other => bot_status_key(other),
+        };
+        let _ = st.storage.save_checkpoint(&sid, "exit_after_stop", &payload);
+        let _ = st.storage.deactivate_session(&sid, Some(&final_status));
         info!(
-            "detached session {} symbol={}",
-            engine.session_id(),
-            engine.config.symbol
+            "exit after terminal status {:?}; session {} kept inactive",
+            status, sid
         );
+        return;
     }
+    engine.mark_detached(
+        "app closed: exchange orders and position retained; software risk offline",
+    );
+    persist_checkpoint(&st.storage, engine, "detached");
+    let _ = st.storage.record_event(
+        "detach",
+        "window closed; orders and position preserved on exchange",
+    );
+    info!(
+        "detached session {} symbol={}",
+        engine.session_id(),
+        engine.config.symbol
+    );
 }
 
 pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Result<bool, String> {
@@ -1337,12 +1363,17 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
     else {
         return Ok(false);
     };
-    // Do not resume halted sessions.
-    if session.status.contains("Halted")
-        || session.status.contains("BreakoutStopped")
-        || session.status.contains("RiskStopped")
-        || session.status.contains("Stopped")
+    let status_l = session.status.to_ascii_lowercase();
+    // Do not resume sessions the user already stopped / that hard-halted.
+    // Note: DB may store snake_case (`stopped`) or Debug (`Stopped`) — compare lowercase.
+    if status_l.contains("halted")
+        || status_l.contains("stopped")
+        || status_l.contains("protective_exit")
+        || status_l == "idle"
     {
+        let _ = st
+            .storage
+            .deactivate_session(&session.session_id, Some(&status_l));
         return Ok(false);
     }
     let Some((phase, payload)) = st
@@ -1352,6 +1383,22 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
     else {
         return Ok(false);
     };
+    let phase_l = phase.to_ascii_lowercase();
+    if phase_l == "stopped"
+        || phase_l == "exit_after_stop"
+        || phase_l == "halted"
+        || phase_l == "halt_failed"
+        || phase_l == "integrity_halt"
+    {
+        let _ = st
+            .storage
+            .deactivate_session(&session.session_id, Some("stopped"));
+        info!(
+            "skip resume: session {} checkpoint phase={phase}",
+            session.session_id
+        );
+        return Ok(false);
+    }
     info!("resuming session {} phase={phase}", session.session_id);
 
     let config: GridConfig = payload
