@@ -16,9 +16,9 @@ Live account example:
 ## Demo
 
 <p align="center">
-  <img src="./images/running.gif" alt="Demo" width="100%" />
+  <img src="./images/hyper-grid-en.gif" alt="Demo" width="100%" />
 </p>
-
+s
 > This app can connect to real markets with real funds. Understand the risks first. Prefer **Simulation** or **Testnet** before going live.
 
 ## How it works
