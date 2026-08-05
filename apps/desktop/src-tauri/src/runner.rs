@@ -12,9 +12,7 @@ const SLOW_POLL_EVERY_TICKS: u32 = 20;
 /// Persist equity/checkpoint about every 30s.
 const CHECKPOINT_EVERY_TICKS: u32 = 10;
 
-use exchange::{
-    fetch_candles, CandleInterval, Exchange, HyperliquidExchange, SimExchange,
-};
+use exchange::{fetch_candles, CandleInterval, Exchange, HyperliquidExchange};
 use grid_engine::{
     compute_atr, derive_bounds, suggest_half_width_pct, AtrMetrics, BotSnapshot, BotStatus,
     BreakoutAction, DynamicGridConfig, EngineEvent, GridConfig, GridEngine, GridMode, MarketKind,
@@ -26,6 +24,7 @@ use storage::{AppConfig, EquitySnapshotRow, FillLedgerRow, FundingRow, Storage};
 use tauri::{AppHandle, Emitter};
 use tracing::{error, info, warn};
 
+use crate::i18n_err::{i18n, i18n_kv};
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,14 +341,20 @@ pub async fn protect_symbol(
             .await
             .map_err(|e| e.to_string())?;
         if !report.confirmed_flat {
-            return Err(format!("仍有 {symbol} 模拟挂单未撤销"));
+            return Err(i18n_kv(
+                "simOrdersRemain",
+                &[("symbol", symbol.to_string())],
+            ));
         }
         if close_position {
             sim.close_position(symbol)
                 .await
                 .map_err(|e| e.to_string())?;
             if sim.position_size().await != Decimal::ZERO {
-                return Err(format!("仍有 {symbol} 模拟仓位未平"));
+                return Err(i18n_kv(
+                    "simPositionRemain",
+                    &[("symbol", symbol.to_string())],
+                ));
             }
         }
         return Ok(());
@@ -361,9 +366,9 @@ pub async fn protect_symbol(
         .await
         .map_err(|e| e.to_string())?;
     if !report.confirmed_flat {
-        return Err(format!(
-            "交易所仍有 {symbol} 挂单未撤销: {:?}",
-            report.remaining_oids
+        return Err(i18n_kv(
+            "exchangeOrdersRemain",
+            &[("symbol", symbol.to_string())],
         ));
     }
     if close_position {
@@ -373,7 +378,13 @@ pub async fn protect_symbol(
             .await
             .map_err(|e| e.to_string())?;
         if remaining != Decimal::ZERO {
-            return Err(format!("交易所仍有 {symbol} 仓位 {remaining}"));
+            return Err(i18n_kv(
+                "exchangePositionRemain",
+                &[
+                    ("symbol", symbol.to_string()),
+                    ("remaining", remaining.to_string()),
+                ],
+            ));
         }
     }
     Ok(())
@@ -1305,7 +1316,11 @@ pub async fn recover_session(app: &AppHandle, st: &mut AppState) -> Result<(), S
     Ok(())
 }
 
-/// Persist detached state on window close — no cancel/flatten.
+/// Persist state on window close.
+///
+/// Simulation orders exist only in-process memory, so sim sessions are ended
+/// (not left active for cross-process resume). Live modes detach without
+/// cancel/flatten so exchange orders/position can be resumed next launch.
 /// Skips revival after manual Stop / Halt so the next launch does not auto-resume.
 pub fn detach_on_exit(st: &mut AppState) {
     st.running_task = false;
@@ -1313,6 +1328,26 @@ pub fn detach_on_exit(st: &mut AppState) {
         return;
     };
     let status = engine.snapshot().status;
+    let sid = engine.session_id().to_string();
+    let payload = engine.checkpoint_payload();
+
+    // Simulation: end the session. Leaving active=1 would make the next process
+    // resume against a fresh empty SimExchange and treat local open orders as
+    // phantoms while holding the global lock (UI freeze).
+    if st.mode == RunMode::Simulation {
+        let _ = st.storage.save_checkpoint(&sid, "exit_sim", &payload);
+        let _ = st.storage.deactivate_session(&sid, Some("stopped"));
+        let _ = st.storage.record_event(
+            "exit_sim",
+            "simulation exit: session ended (orders were in-memory only)",
+        );
+        info!(
+            "simulation exit; session {} deactivated (no cross-process resume)",
+            sid
+        );
+        return;
+    }
+
     // After Stop the engine is Idle; after risk/breakout it may be Halted / BreakoutStopped.
     // Do not upsert active=1 or the next launch will "resume" a session the user already stopped.
     if matches!(
@@ -1322,8 +1357,6 @@ pub fn detach_on_exit(st: &mut AppState) {
             | BotStatus::BreakoutStopped
             | BotStatus::ProtectiveExit
     ) {
-        let sid = engine.session_id().to_string();
-        let payload = engine.checkpoint_payload();
         let final_status = match status {
             BotStatus::Idle => "stopped".to_string(),
             other => bot_status_key(other),
@@ -1386,6 +1419,7 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
     let phase_l = phase.to_ascii_lowercase();
     if phase_l == "stopped"
         || phase_l == "exit_after_stop"
+        || phase_l == "exit_sim"
         || phase_l == "halted"
         || phase_l == "halt_failed"
         || phase_l == "integrity_halt"
@@ -1399,6 +1433,32 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
         );
         return Ok(false);
     }
+
+    // Residual simulation sessions are not recoverable: sim orders never leave
+    // process memory. Deactivate and skip so we do not reconcile against an
+    // empty SimExchange (phantom fills + long global-lock hold → UI freeze).
+    let checkpoint_mode = payload
+        .get("mode")
+        .and_then(|v| serde_json::from_value::<RunMode>(v.clone()).ok());
+    if matches!(checkpoint_mode, Some(RunMode::Simulation)) || st.mode == RunMode::Simulation
+    {
+        if matches!(checkpoint_mode, Some(RunMode::Simulation)) {
+            let _ = st
+                .storage
+                .deactivate_session(&session.session_id, Some("stopped"));
+            info!(
+                "skip resume: residual simulation session {} deactivated",
+                session.session_id
+            );
+        } else {
+            info!(
+                "skip resume: current mode is simulation (session {})",
+                session.session_id
+            );
+        }
+        return Ok(false);
+    }
+
     info!("resuming session {} phase={phase}", session.session_id);
 
     let config: GridConfig = payload
@@ -1409,41 +1469,23 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
         .ok_or("resume: missing config")?;
 
     let mode = st.mode;
-    if mode == RunMode::Simulation {
-        let mid = (config.lower_price + config.upper_price) / Decimal::from(2);
-        st.sim = Some(SimExchange::with_band(
-            config.symbol.clone(),
-            mid,
-            config.total_budget * Decimal::from(2),
-            Decimal::ZERO,
-            config.lower_price,
-            config.upper_price,
-        ));
-        st.sim
-            .as_mut()
-            .unwrap()
-            .connect()
-            .await
+    if st.private_key.trim().is_empty() {
+        return Err(i18n("resumeRequiresKey"));
+    }
+    if st.hl.is_none() {
+        let mut hl = HyperliquidExchange::new(mode);
+        hl.set_private_key(&st.private_key)
             .map_err(|e| e.to_string())?;
-    } else {
-        if st.private_key.trim().is_empty() {
-            return Err("resume requires private key".into());
-        }
-        if st.hl.is_none() {
-            let mut hl = HyperliquidExchange::new(mode);
-            hl.set_private_key(&st.private_key)
-                .map_err(|e| e.to_string())?;
-            st.hl = Some(hl);
-        }
-        st.hl
-            .as_mut()
-            .unwrap()
-            .connect()
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Err(e) = st.hl.as_mut().unwrap().prime_seen_fills().await {
-            warn!("prime_seen_fills: {e}");
-        }
+        st.hl = Some(hl);
+    }
+    st.hl
+        .as_mut()
+        .unwrap()
+        .connect()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = st.hl.as_mut().unwrap().prime_seen_fills().await {
+        warn!("prime_seen_fills: {e}");
     }
 
     let mut engine = GridEngine::new(config.clone(), mode, config.total_budget)
@@ -1453,7 +1495,12 @@ pub async fn try_resume_active_session(app: &AppHandle, st: &mut AppState) -> Re
     engine.mark_recovering("resuming after app restart");
     st.engine = Some(engine);
     st.running_task = true;
-    recover_session(app, st).await?;
+    if let Err(e) = recover_session(app, st).await {
+        // Avoid fake-dead state: resume failed but running_task would block Start.
+        st.running_task = false;
+        warn!("resume recover_session failed; cleared running_task: {e}");
+        return Err(e);
+    }
     let _ = st.storage.record_event("resume", "session resumed from checkpoint");
     Ok(true)
 }

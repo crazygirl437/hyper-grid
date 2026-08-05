@@ -196,8 +196,8 @@ function applyOverlays(
     linesRef.current.push(line);
   }
 
-  const buyText = lang.startsWith("zh") ? "买" : "B";
-  const sellText = lang.startsWith("zh") ? "卖" : "S";
+  const buyText = t("app.markerBuy");
+  const sellText = t("app.markerSell");
   const markers: SeriesMarker<Time>[] = trades
     .filter((tr) => Number.isFinite(tr.price) && tr.price > 0)
     .map((tr) => {

@@ -122,6 +122,8 @@
     "legendSell": "▼ Sell",
     "legendOrder": "-- Orders",
     "legendGrid": "-- Grid",
+    "markerBuy": "B",
+    "markerSell": "S",
     "orderLineBuy": "Bid",
     "orderLineSell": "Ask",
     "chartInterval": "Candle interval",
@@ -279,5 +281,22 @@
       "fundingHigh": "Elevated funding",
       "isolatedOnly": "Isolated margin only"
     }
+  },
+  "errors": {
+    "botRunningMode": "Stop the bot before switching mode",
+    "botRunningKey": "Stop the bot before changing the private key",
+    "botAlreadyRunning": "Bot is already running",
+    "privateKeyRequired": "Private key required for testnet/mainnet",
+    "midOutOfRange": "Current mid {{mid}} is outside the grid band {{lower}}–{{upper}}. Adjust the band or enable dynamic mode.",
+    "cancelBeforeStartFailed": "Failed to cancel orders before start: {{detail}}",
+    "cancelSymbolBeforeStartFailed": "Failed to cancel this symbol's orders before start: {{detail}}",
+    "stopFlattenFailed": "Strategy stopped, but cancel/close failed: {{detail}}",
+    "noSessionToClear": "No session to clear",
+    "resumeRequiresKey": "Resume requires a private key",
+    "simOrdersRemain": "Simulation still has open {{symbol}} orders",
+    "simPositionRemain": "Simulation still has an open {{symbol}} position",
+    "exchangeOrdersRemain": "Exchange still has open {{symbol}} orders",
+    "exchangePositionRemain": "Exchange still has an open {{symbol}} position of {{remaining}}",
+    "unknown": "{{detail}}"
   }
 }
