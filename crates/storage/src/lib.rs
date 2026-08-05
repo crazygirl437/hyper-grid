@@ -91,10 +91,10 @@ fn default_symbol() -> String {
     "BTC".into()
 }
 fn default_grid_count() -> u32 {
-    10
+    30
 }
 fn default_budget() -> String {
-    "1000".into()
+    "3000".into()
 }
 fn default_spacing() -> String {
     "arithmetic".into()

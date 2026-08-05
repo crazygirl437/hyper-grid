@@ -17,7 +17,10 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { FlattenOverlay } from "./components/FlattenOverlay";
 import { PnlAnalytics } from "./components/PnlAnalytics";
 import { PairScreener } from "./components/PairScreener";
-import i18n from "./i18n";
+import { LanguagePicker } from "./components/LanguagePicker";
+import i18n, { resolveLocale } from "./i18n";
+import { localizeError } from "./lib/localizeError";
+import hyperliquidLogo from "./assets/hyperliquid.svg";
 
 type Tab = "account" | "configure" | "screener" | "dashboard" | "analytics";
 
@@ -38,8 +41,8 @@ const defaultForm = {
   symbol: "BTC",
   lowerPrice: "",
   upperPrice: "",
-  gridCount: 10,
-  totalBudget: "1000",
+  gridCount: 30,
+  totalBudget: "3000",
   spacing: "arithmetic",
   breakoutAction: "recenter",
   maxDrawdownPct: "20",
@@ -127,6 +130,10 @@ function estimateNextFundingUsdc(
 
 export default function App() {
   const { t } = useTranslation();
+  const showError = useCallback(
+    (e: unknown) => setError(localizeError(e, t)),
+    [t],
+  );
   const [tab, setTab] = useState<Tab>("account");
   const [screenerMounted, setScreenerMounted] = useState(false);
   const [mode, setMode] = useState("simulation");
@@ -282,12 +289,12 @@ export default function App() {
         });
         setCandles(rows);
       } catch (e: any) {
-        if (!silent) setError(String(e));
+        if (!silent) showError(e);
       } finally {
         if (!silent) setCandlesLoading(false);
       }
     },
-    []
+    [showError]
   );
 
   function pushTrade(side: "buy" | "sell", price: number, size?: string, id?: string) {
@@ -396,11 +403,11 @@ export default function App() {
       const rateLimited = /429|too many requests/i.test(msg);
       // Keep existing list usable; don't spam a hard error on rate limits.
       if (markets.length > 0 && (silent || rateLimited)) {
-        setTip(rateLimited ? t("app.marketsRateLimited") : msg);
+        setTip(rateLimited ? t("app.marketsRateLimited") : localizeError(msg, t));
         return;
       }
       if (!silent || markets.length === 0) {
-        setError(rateLimited ? t("app.marketsRateLimited") : msg);
+        setError(rateLimited ? t("app.marketsRateLimited") : localizeError(msg, t));
       }
     } finally {
       if (gen === marketsLoadGen.current && !silent) setMarketsLoading(false);
@@ -473,7 +480,7 @@ export default function App() {
       setPriceHistory([{ time: Math.floor(Date.now() / 1000), value: midVal }]);
       void loadCandles(symbol, chartInterval);
     } catch (e: any) {
-      setError(String(e));
+      showError(e);
     } finally {
       setMidLoading(false);
     }
@@ -485,15 +492,15 @@ export default function App() {
         const settings = await api<AppSettings>("get_settings");
         skipNextPersist.current = true;
         if (settings.env_path) setEnvPath(settings.env_path);
-        if (settings.language) await i18n.changeLanguage(settings.language);
+        if (settings.language) await i18n.changeLanguage(resolveLocale(settings.language));
         setMode(settings.mode || "simulation");
         setPrivateKeyFromStorage(settings.private_key || "");
         setForm({
           symbol: settings.symbol || "BTC",
           lowerPrice: settings.lower_price || "",
           upperPrice: settings.upper_price || "",
-          gridCount: settings.grid_count || 10,
-          totalBudget: settings.total_budget || "1000",
+          gridCount: settings.grid_count || 30,
+          totalBudget: settings.total_budget || "3000",
           spacing: settings.spacing || "arithmetic",
           breakoutAction: settings.breakout_action || "cancel_close_and_stop",
           maxDrawdownPct: settings.max_drawdown_pct || "20",
@@ -564,8 +571,8 @@ export default function App() {
                     symbol: settings.symbol || "BTC",
                     lowerPrice: settings.lower_price || "",
                     upperPrice: settings.upper_price || "",
-                    gridCount: settings.grid_count || 10,
-                    totalBudget: settings.total_budget || "1000",
+                    gridCount: settings.grid_count || 30,
+                    totalBudget: settings.total_budget || "3000",
                     spacing: settings.spacing || "arithmetic",
                     breakoutAction:
                       gridMode === "dynamic"
@@ -589,7 +596,7 @@ export default function App() {
                 setTab("dashboard");
               } catch (e) {
                 console.warn("auto_start failed", e);
-                setError(String(e));
+                showError(e);
               }
             })();
           }, 2200);
@@ -730,7 +737,7 @@ export default function App() {
         await persistSettings();
       }
     } catch (e: any) {
-      setError(String(e));
+      showError(e);
     }
   }
 
@@ -742,7 +749,7 @@ export default function App() {
       setMid(midVal);
       pushPrice(midVal);
     } catch (e: any) {
-      setError(String(e));
+      showError(e);
     } finally {
       setMidLoading(false);
     }
@@ -804,7 +811,7 @@ export default function App() {
       }
       return { lower: String(lower), upper: String(upper), mid: midVal };
     } catch (e: any) {
-      if (!opts?.silent) setError(String(e));
+      if (!opts?.silent) showError(e);
       return null;
     }
   }
@@ -852,7 +859,7 @@ export default function App() {
         })),
       );
     } catch (e: any) {
-      setError(String(e));
+      showError(e);
     }
   }
 
@@ -958,18 +965,19 @@ export default function App() {
       }
     } catch (e: any) {
       const msg = String(e);
-      if (/already running/i.test(msg)) {
+      if (/already running/i.test(msg) || msg.includes("i18n:botAlreadyRunning")) {
         setTip(t("app.alreadyRunningTip"));
         setTab("dashboard");
         return;
       }
-      setError(msg);
+      showError(e);
     }
   }
 
   async function changeLanguage(lng: string) {
-    await i18n.changeLanguage(lng);
-    await api("set_language", { language: lng });
+    const code = resolveLocale(lng);
+    await i18n.changeLanguage(code);
+    await api("set_language", { language: code });
     // Also refresh full .env so LANGUAGE stays aligned with other fields.
     if (settingsReady.current) {
       void persistSettings();
@@ -1114,7 +1122,7 @@ export default function App() {
               setStatus(await api<BotSnapshot>("stop_bot"));
               setAlertBanner(null);
             } catch (e: any) {
-              setError(String(e));
+              showError(e);
             }
           })();
         }}
@@ -1130,7 +1138,17 @@ export default function App() {
       )}
       <header className="top">
         <div className="top-left">
-          <div className="brand">{t("app.title")}</div>
+          <div className="brand">
+            <img
+              className="brand-logo"
+              src={hyperliquidLogo}
+              alt=""
+              width={28}
+              height={28}
+              decoding="async"
+            />
+            <span className="brand-name">{t("app.title")}</span>
+          </div>
           <nav className="tabs">
             {(["account", "configure", "screener", "dashboard", "analytics"] as Tab[]).map((id) => (
               <button
@@ -1154,22 +1172,10 @@ export default function App() {
         </div>
         <div className="top-right">
           <span className="mode-pill">{t(`app.${mode}`)}</span>
-          <div className="lang-switch" role="group" aria-label={t("app.language")}>
-            <button
-              type="button"
-              className={i18n.language.startsWith("zh") ? "lang active" : "lang"}
-              onClick={() => void changeLanguage("zh-CN")}
-            >
-              中文
-            </button>
-            <button
-              type="button"
-              className={i18n.language.startsWith("en") ? "lang active" : "lang"}
-              onClick={() => void changeLanguage("en")}
-            >
-              EN
-            </button>
-          </div>
+          <LanguagePicker
+            value={i18n.language}
+            onChange={(code) => void changeLanguage(code)}
+          />
         </div>
       </header>
 
@@ -1223,7 +1229,7 @@ export default function App() {
                       }
                     }
                   } catch (err: any) {
-                    setError(String(err));
+                    showError(err);
                   }
                 })();
               }}
@@ -1746,7 +1752,7 @@ export default function App() {
                   <small>{t("app.orderFailHelp")}</small>
                 </label>
               </div>
-              <details className="advanced config-import">
+              <details className="advanced config-import" open>
                 <summary>{t("app.dynamicAdvanced")}</summary>
                 <div className="config-secondary-grid">
                   <label>

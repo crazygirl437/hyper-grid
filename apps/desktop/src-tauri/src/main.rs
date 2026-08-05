@@ -1,4 +1,5 @@
 mod runner;
+mod i18n_err;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use i18n_err::{i18n, i18n_kv};
 use runner::{
     build_grid_config, detach_on_exit, idle_snapshot, protect_symbol, resolve_dynamic_bounds,
     run_loop, try_resume_active_session,
@@ -269,7 +271,7 @@ async fn set_mode(state: State<'_, Arc<Mutex<AppState>>>, mode: String) -> Resul
     let mut st = state.lock().await;
     let next = parse_mode(&mode);
     if st.running_task && next != st.mode {
-        return Err("机器人运行中，请先停止再切换模式".into());
+        return Err(i18n("botRunningMode"));
     }
     st.mode = next;
     // Drop exchange clients so the next connect uses the new API endpoint.
@@ -292,7 +294,7 @@ async fn set_private_key(
     let mut st = state.lock().await;
     let key_changed = private_key != st.private_key;
     if st.running_task && key_changed {
-        return Err("机器人运行中，请先停止再更换私钥".into());
+        return Err(i18n("botRunningKey"));
     }
     st.private_key = private_key.clone();
     let mut address = String::new();
@@ -476,10 +478,10 @@ async fn start_bot(
             if let Some(engine) = st.engine.as_ref() {
                 return Ok(engine.snapshot());
             }
-            return Err("bot already running".into());
+            return Err(i18n("botAlreadyRunning"));
         }
         if st.mode != RunMode::Simulation && st.private_key.trim().is_empty() {
-            return Err("private key required for testnet/mainnet".into());
+            return Err(i18n("privateKeyRequired"));
         }
         let app_cfg = st.storage.load_config().map_err(|e| e.to_string())?;
         let runner_req = runner::StartRequest {
@@ -518,9 +520,13 @@ async fn start_bot(
                 resolve_dynamic_bounds(RunMode::Testnet, &mut config, live).await?;
             }
             if live <= config.lower_price || live >= config.upper_price {
-                return Err(format!(
-                    "当前中间价 {live} 不在网格区间 {}–{} 内，请重新设置区间或启用动态模式",
-                    config.lower_price, config.upper_price
+                return Err(i18n_kv(
+                    "midOutOfRange",
+                    &[
+                        ("mid", live.to_string()),
+                        ("lower", config.lower_price.to_string()),
+                        ("upper", config.upper_price.to_string()),
+                    ],
                 ));
             }
             let seed = live;
@@ -542,7 +548,13 @@ async fn start_bot(
             // Cancel sim leftovers for this symbol only (preserve other state).
             protect_symbol(&mut st, &config.symbol, false)
                 .await
-                .map_err(|e| format!("启动前撤单失败: {e}"))?;
+                .map_err(|e| {
+                    if e.starts_with("i18n:") {
+                        e
+                    } else {
+                        i18n_kv("cancelBeforeStartFailed", &[("detail", e)])
+                    }
+                })?;
             if let Some(sim) = st.sim.as_ref() {
                 sim.set_band(config.lower_price, config.upper_price).await;
             }
@@ -571,15 +583,25 @@ async fn start_bot(
                 resolve_dynamic_bounds(st.mode, &mut config, live_mid).await?;
             }
             if live_mid <= config.lower_price || live_mid >= config.upper_price {
-                return Err(format!(
-                    "当前中间价 {live_mid} 不在网格区间 {}–{} 内，请重新设置区间或启用动态模式",
-                    config.lower_price, config.upper_price
+                return Err(i18n_kv(
+                    "midOutOfRange",
+                    &[
+                        ("mid", live_mid.to_string()),
+                        ("lower", config.lower_price.to_string()),
+                        ("upper", config.upper_price.to_string()),
+                    ],
                 ));
             }
             // Cancel only this strategy symbol — never flatten the whole account.
             protect_symbol(&mut st, &config.symbol, false)
                 .await
-                .map_err(|e| format!("启动前撤销本币种挂单失败: {e}"))?;
+                .map_err(|e| {
+                    if e.starts_with("i18n:") {
+                        e
+                    } else {
+                        i18n_kv("cancelSymbolBeforeStartFailed", &[("detail", e)])
+                    }
+                })?;
             let hl = st.hl.as_mut().unwrap();
             hl.set_leverage(&config.symbol, config.leverage, config.is_cross)
                 .await
@@ -806,7 +828,10 @@ async fn stop_bot(
     );
     if let Err(e) = res {
         error!("stop protect_symbol failed: {e}");
-        return Err(format!("已停止策略，但撤单/平仓失败: {e}"));
+        if e.starts_with("i18n:") {
+            return Err(e);
+        }
+        return Err(i18n_kv("stopFlattenFailed", &[("detail", e)]));
     }
     if let Some(engine) = st.engine.as_mut() {
         engine.note("stopped: canceled symbol orders & closed position");
@@ -860,7 +885,7 @@ async fn clear_analytics(
             .or_else(|| st.engine.as_ref().map(|e| e.session_id().to_string()))
     };
     if !wipe_all && sid.is_none() {
-        return Err("没有可清除的会话".into());
+        return Err(i18n("noSessionToClear"));
     }
     let cleared = st
         .storage
@@ -1146,10 +1171,10 @@ async fn save_settings(
     let mode_changed = new_mode != st.mode;
 
     if st.running_task && mode_changed {
-        return Err("机器人运行中，请先停止再切换模式".into());
+        return Err(i18n("botRunningMode"));
     }
     if st.running_task && key_changed {
-        return Err("机器人运行中，请先停止再更换私钥".into());
+        return Err(i18n("botRunningKey"));
     }
 
     st.mode = new_mode;
@@ -1230,6 +1255,9 @@ pub fn run() {
                     }
                     Err(e) => {
                         error!("session resume failed: {e}");
+                        // Belt-and-suspenders: never leave running_task stuck after
+                        // a failed live resume (blocks Start → looks like a freeze).
+                        st.running_task = false;
                         let _ = handle.emit(
                             "bot-alert",
                             serde_json::json!({
@@ -1290,8 +1318,13 @@ pub fn run() {
                     {
                         rt.block_on(async move {
                             let mut st = state.lock().await;
+                            let was_sim = st.mode == RunMode::Simulation;
                             detach_on_exit(&mut st);
-                            info!("exit: session detached (orders/position preserved)");
+                            if was_sim {
+                                info!("exit: simulation session ended");
+                            } else {
+                                info!("exit: session detached (orders/position preserved)");
+                            }
                         });
                     }
                 })

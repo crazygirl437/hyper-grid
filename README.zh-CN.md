@@ -6,6 +6,8 @@
 
 设定价格区间和投入后，程序会在现价下方挂买单、上方挂卖单，希望行情在区间内来回波动时赚取差价。
 
+界面支持多国语言：中文、English、日本語、한국어、Español、Français、Deutsch、Português、Русский（右上角可切换，并会按系统语言自动选择）。
+
 - **邀请链接**：[https://app.hyperliquid.xyz/join/MMREFCSI](https://app.hyperliquid.xyz/join/MMREFCSI) — 可减免手续费，作者也可获得奖励  
 - **作者 Telegram**：[https://t.me/smith123_lee](https://t.me/smith123_lee) — 用着顺手也可联系了解高级版  
 
@@ -48,7 +50,7 @@
      ./hyper-grid-linux-x86_64.AppImage
      ```
 2. 打开软件，建议先选 **模拟盘** 试跑。
-3. 在顶栏切换 **中文 / EN**。
+3. 在右上角语言菜单切换界面语言（默认跟随系统）。
 
 **Linux 说明：** AppImage 在 Ubuntu 22.04 上构建，需要较新的 glibc；**Ubuntu 20.04 无法运行**桌面版。
 

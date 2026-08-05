@@ -122,6 +122,8 @@
     "legendSell": "▼ 卖出",
     "legendOrder": "-- 挂单",
     "legendGrid": "-- 网格",
+    "markerBuy": "买",
+    "markerSell": "卖",
     "orderLineBuy": "挂买",
     "orderLineSell": "挂卖",
     "chartInterval": "K线周期",
@@ -279,5 +281,22 @@
       "fundingHigh": "资金费率偏高",
       "isolatedOnly": "仅支持逐仓"
     }
+  },
+  "errors": {
+    "botRunningMode": "机器人运行中，请先停止再切换模式",
+    "botRunningKey": "机器人运行中，请先停止再更换私钥",
+    "botAlreadyRunning": "机器人已在运行中",
+    "privateKeyRequired": "测试网/主网需要私钥",
+    "midOutOfRange": "当前中间价 {{mid}} 不在网格区间 {{lower}}–{{upper}} 内，请重新设置区间或启用动态模式",
+    "cancelBeforeStartFailed": "启动前撤单失败：{{detail}}",
+    "cancelSymbolBeforeStartFailed": "启动前撤销本币种挂单失败：{{detail}}",
+    "stopFlattenFailed": "已停止策略，但撤单/平仓失败：{{detail}}",
+    "noSessionToClear": "没有可清除的会话",
+    "resumeRequiresKey": "恢复会话需要私钥",
+    "simOrdersRemain": "仍有 {{symbol}} 模拟挂单未撤销",
+    "simPositionRemain": "仍有 {{symbol}} 模拟仓位未平",
+    "exchangeOrdersRemain": "交易所仍有 {{symbol}} 挂单未撤销",
+    "exchangePositionRemain": "交易所仍有 {{symbol}} 仓位 {{remaining}}",
+    "unknown": "{{detail}}"
   }
 }

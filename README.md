@@ -6,6 +6,8 @@
 
 Set a price range and size. The app places buys below the market and sells above it — aiming to profit when price oscillates inside that range.
 
+The UI is multilingual: 中文, English, 日本語, 한국어, Español, Français, Deutsch, Português, and Русский (switch in the top-right; defaults to your system language).
+
 - **Referral link:** [https://app.hyperliquid.xyz/join/MMREFCSI](https://app.hyperliquid.xyz/join/MMREFCSI) — fee discount for you; rewards for the author  
 - **Author Telegram:** [https://t.me/smith123_lee](https://t.me/smith123_lee) — if you like the app, feel free to ask about the Pro edition  
 
@@ -48,7 +50,7 @@ If you do not want to compile, download a prebuilt app from **[Releases](../../r
      ./hyper-grid-linux-x86_64.AppImage
      ```
 2. Open the app and try **Simulation** first.
-3. Switch **中文 / EN** in the top bar.
+3. Switch the UI language from the top-right language menu (defaults to your system language).
 
 **Linux note:** The AppImage is built on Ubuntu 22.04 (needs a recent glibc). Ubuntu **20.04** cannot run the desktop build.
 
