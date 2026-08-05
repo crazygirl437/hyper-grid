@@ -80,6 +80,12 @@ pub fn env_path() -> PathBuf {
     resolve_program_dir().join(".env")
 }
 
+/// Writable data directory next to the program (`<program_dir>/data`).
+/// Holds SQLite, config.json mirror, and analytics exports.
+pub fn resolve_data_dir() -> PathBuf {
+    resolve_program_dir().join("data")
+}
+
 pub fn load_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
     if !path.exists() {
@@ -159,6 +165,13 @@ pub fn apply_env_map(cfg: &mut AppConfig, map: &BTreeMap<String, String>) {
                 }
             }
         };
+        ($field:ident, $key:expr, u64) => {
+            if let Some(v) = map.get($key) {
+                if let Ok(n) = v.parse::<u64>() {
+                    cfg.$field = n;
+                }
+            }
+        };
         ($field:ident, $key:expr, bool) => {
             if let Some(v) = map.get($key) {
                 cfg.$field = matches!(
@@ -187,6 +200,16 @@ pub fn apply_env_map(cfg: &mut AppConfig, map: &BTreeMap<String, String>) {
     take!(chart_mode, "CHART_MODE");
     take!(chart_interval, "CHART_INTERVAL");
     take!(range_pct, "RANGE_PCT");
+    take!(grid_mode, "GRID_MODE");
+    take!(atr_interval, "ATR_INTERVAL");
+    take!(atr_period, "ATR_PERIOD", u32);
+    take!(atr_mult, "ATR_MULT");
+    take!(confirm_bars, "CONFIRM_BARS", u32);
+    take!(recenter_cooldown_secs, "RECENTER_COOLDOWN_SECS", u64);
+    take!(max_recenters_per_day, "MAX_RECENTERS_PER_DAY", u32);
+    take!(auto_start, "AUTO_START", bool);
+    take!(resume_on_restart, "RESUME_ON_RESTART", bool);
+    take!(exit_policy, "EXIT_POLICY");
 }
 
 #[cfg(test)]

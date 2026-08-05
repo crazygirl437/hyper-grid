@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api } from "../lib/api";
 
 export type FlattenReason = "startup" | "start" | "stop" | "exit" | "manual" | string;
 
@@ -12,6 +11,11 @@ type FlattenEnd = {
   error?: string | null;
 };
 
+/**
+ * Overlay for explicit cancel/close operations (stop button).
+ * Window close no longer flattens — it only destroys the window so Rust can
+ * detach and checkpoint (orders & position stay on the exchange).
+ */
 export function FlattenOverlay() {
   const { t } = useTranslation();
   const [reason, setReason] = useState<FlattenReason | null>(null);
@@ -31,7 +35,6 @@ export function FlattenOverlay() {
       unEnd = await listen<FlattenEnd>("flatten-end", (e) => {
         if (!e.payload.ok && e.payload.error) {
           setError(String(e.payload.error));
-          // Keep overlay briefly so user can read the error, then close.
           window.setTimeout(() => {
             setReason(null);
             setError("");
@@ -54,23 +57,12 @@ export function FlattenOverlay() {
       try {
         const win = getCurrentWindow();
         unlisten = await win.onCloseRequested(async (event) => {
-          event.preventDefault();
-          if (exitingRef.current) return;
+          // Allow close without cancel/flatten. Rust Exit handler checkpoints.
+          if (exitingRef.current) {
+            event.preventDefault();
+            return;
+          }
           exitingRef.current = true;
-          setError("");
-          setReason("exit");
-          try {
-            await api("flatten_now", { reason: "exit" });
-          } catch (e: any) {
-            setError(String(e));
-            // Still exit after showing error briefly.
-            await new Promise((r) => setTimeout(r, 1500));
-          }
-          try {
-            await win.destroy();
-          } catch {
-            // ignore
-          }
         });
       } catch {
         // Not running inside Tauri window.

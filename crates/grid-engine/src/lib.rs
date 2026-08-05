@@ -7,11 +7,16 @@ mod engine;
 mod levels;
 mod risk;
 mod types;
+mod volatility;
 
-pub use engine::{EngineEvent, GridEngine};
-pub use levels::generate_levels;
+pub use engine::{EngineEvent, GridEngine, RecenterPlan};
+pub use levels::{generate_levels, generate_levels_with_bounds};
 pub use risk::{RiskConfig, RiskState};
 pub use types::*;
+pub use volatility::{
+    compute_atr, derive_bounds, is_outside_bounds, reentered_with_hysteresis,
+    suggest_half_width_pct, AtrMetrics, OhlcBar,
+};
 
 #[derive(Debug, Error)]
 pub enum GridError {
@@ -472,6 +477,8 @@ mod tests {
             market: MarketKind::Perp,
             leverage,
             is_cross: false,
+        grid_mode: GridMode::Fixed,
+        dynamic: DynamicGridConfig::default(),
         }
     }
 
@@ -490,6 +497,8 @@ mod tests {
             market: MarketKind::Perp,
             leverage: 10,
             is_cross: false,
+        grid_mode: GridMode::Fixed,
+        dynamic: DynamicGridConfig::default(),
         }
     }
 
@@ -527,6 +536,8 @@ mod tests {
             market: MarketKind::Perp,
             leverage: 10,
             is_cross: false,
+        grid_mode: GridMode::Fixed,
+        dynamic: DynamicGridConfig::default(),
         };
         let mid = (cfg.lower_price + cfg.upper_price) / Decimal::from(2);
         let p = preview_grid_with_options(&cfg, mid, None, Some(10)).unwrap();
@@ -589,6 +600,8 @@ mod tests {
             market: MarketKind::Perp,
             leverage: 10,
             is_cross: false,
+        grid_mode: GridMode::Fixed,
+        dynamic: DynamicGridConfig::default(),
         };
         let mid = (cfg.lower_price + cfg.upper_price) / Decimal::from(2);
         let p = preview_grid_with_options(&cfg, mid, None, Some(10)).unwrap();

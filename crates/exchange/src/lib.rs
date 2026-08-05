@@ -7,4 +7,7 @@ pub use hyperliquid::{
     HyperliquidExchange,
 };
 pub use sim::SimExchange;
-pub use traits::{Balance, Exchange, ExchangeError, ExchangeResult, MarketInfo, Ticker};
+pub use traits::{
+    Balance, CancelReport, Exchange, ExchangeError, ExchangeResult, MarketInfo, PositionSnapshot,
+    ReconcileReport, Ticker,
+};

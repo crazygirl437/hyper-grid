@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
                 market: grid_engine::MarketKind::Perp,
                 leverage: 5,
                 is_cross: true,
+            grid_mode: grid_engine::GridMode::Fixed,
+            dynamic: grid_engine::DynamicGridConfig::default(),
             };
             let preview = preview_grid(&cfg, mid.parse()?)?;
             println!("{}", serde_json::to_string_pretty(&preview)?);
@@ -140,6 +142,8 @@ async fn main() -> Result<()> {
                 market: grid_engine::MarketKind::Perp,
                 leverage: 5,
                 is_cross: true,
+            grid_mode: grid_engine::GridMode::Fixed,
+            dynamic: grid_engine::DynamicGridConfig::default(),
             };
             let mid0 = (cfg.lower_price + cfg.upper_price) / Decimal::from(2);
             let mut sim = SimExchange::with_band(

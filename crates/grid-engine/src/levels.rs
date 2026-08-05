@@ -7,34 +7,49 @@ use crate::{
 };
 
 pub fn generate_levels(config: &GridConfig, mid_price: Decimal) -> GridResult<Vec<GridLevel>> {
+    generate_levels_with_bounds(config, mid_price, config.lower_price, config.upper_price)
+}
+
+/// Generate levels using explicit active bounds (for recentered grids).
+pub fn generate_levels_with_bounds(
+    config: &GridConfig,
+    mid_price: Decimal,
+    lower: Decimal,
+    upper: Decimal,
+) -> GridResult<Vec<GridLevel>> {
     config.validate()?;
+    if lower <= Decimal::ZERO || upper <= Decimal::ZERO || lower >= upper {
+        return Err(GridError::InvalidConfig(
+            "active bounds must be positive with lower < upper".into(),
+        ));
+    }
     let n = config.grid_count;
     let size = config.size_per_level()?;
     let mut prices = Vec::with_capacity(n as usize);
 
     match config.spacing {
         GridSpacing::Arithmetic => {
-            let step = (config.upper_price - config.lower_price) / Decimal::from(n - 1);
+            let step = (upper - lower) / Decimal::from(n - 1);
             for i in 0..n {
-                prices.push(config.lower_price + step * Decimal::from(i));
+                prices.push(lower + step * Decimal::from(i));
             }
         }
         GridSpacing::Geometric => {
-            if config.lower_price <= Decimal::ZERO {
+            if lower <= Decimal::ZERO {
                 return Err(GridError::InvalidConfig(
                     "geometric grid requires positive lower_price".into(),
                 ));
             }
-            let ratio = (config.upper_price / config.lower_price)
+            let ratio = (upper / lower)
                 .powf(((n - 1) as f64).recip())
                 .map_err(|_| GridError::InvalidConfig("invalid geometric ratio".into()))?;
-            let mut p = config.lower_price;
+            let mut p = lower;
             for _ in 0..n {
                 prices.push(p);
                 p *= ratio;
             }
             if let Some(last) = prices.last_mut() {
-                *last = config.upper_price;
+                *last = upper;
             }
         }
     }
@@ -45,12 +60,11 @@ pub fn generate_levels(config: &GridConfig, mid_price: Decimal) -> GridResult<Ve
             Side::Buy
         } else if price > mid_price {
             Side::Sell
-        } else if mid_price - config.lower_price <= config.upper_price - mid_price {
+        } else if mid_price - lower <= upper - mid_price {
             Side::Sell
         } else {
             Side::Buy
         };
-        // Skip exact mid as resting order ambiguity: treat as sell above-or-equal bias already handled
         levels.push(GridLevel {
             index: index as u32,
             price: price.round_dp(8),
@@ -95,6 +109,8 @@ mod tests {
             market: crate::MarketKind::Perp,
             leverage: 5,
             is_cross: true,
+            grid_mode: crate::GridMode::Fixed,
+            dynamic: crate::DynamicGridConfig::default(),
         }
     }
 

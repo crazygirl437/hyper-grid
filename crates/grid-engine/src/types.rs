@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 use crate::{GridError, GridResult};
@@ -42,6 +43,8 @@ pub enum BreakoutAction {
     CancelAndPause,
     /// Cancel this strategy's symbol orders, close its position, and require a fresh start.
     CancelCloseAndStop,
+    /// Soft-confirm breakout then recenter grid while retaining position.
+    Recenter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,8 +53,13 @@ pub enum BotStatus {
     Idle,
     Running,
     Paused,
+    SoftBreakout,
+    Recentering,
+    Recovering,
     ProtectiveExit,
     BreakoutStopped,
+    /// Local loop detached; exchange orders/position retained for resume.
+    Detached,
     Halted,
 }
 
@@ -62,6 +70,95 @@ pub enum MarketKind {
     Perp,
     /// Spot (legacy). Buy-first inventory style.
     Spot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GridMode {
+    #[default]
+    Fixed,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeInForce {
+    #[default]
+    Gtc,
+    Ioc,
+    Alo,
+}
+
+/// Runtime parameters for ATR-driven dynamic grids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicGridConfig {
+    /// Candle interval string, e.g. "15m" / "1h".
+    #[serde(default = "default_atr_interval")]
+    pub atr_interval: String,
+    #[serde(default = "default_atr_period")]
+    pub atr_period: u32,
+    /// Half-width = ATR% × this multiplier (clamped by min/max).
+    #[serde(default = "default_atr_mult")]
+    pub atr_mult: Decimal,
+    #[serde(default = "default_min_half_width")]
+    pub min_half_width_pct: Decimal,
+    #[serde(default = "default_max_half_width")]
+    pub max_half_width_pct: Decimal,
+    /// Consecutive closed candles outside bounds before hard recenter.
+    #[serde(default = "default_confirm_bars")]
+    pub confirm_bars: u32,
+    /// Minimum seconds between recenters.
+    #[serde(default = "default_cooldown_secs")]
+    pub recenter_cooldown_secs: u64,
+    #[serde(default = "default_max_recenters_day")]
+    pub max_recenters_per_day: u32,
+    /// Hysteresis percent of band width for re-entry after soft breakout.
+    #[serde(default = "default_hysteresis")]
+    pub reentry_hysteresis_pct: Decimal,
+}
+
+fn default_atr_interval() -> String {
+    "15m".into()
+}
+fn default_atr_period() -> u32 {
+    14
+}
+fn default_atr_mult() -> Decimal {
+    dec!(1.25)
+}
+fn default_min_half_width() -> Decimal {
+    dec!(2)
+}
+fn default_max_half_width() -> Decimal {
+    dec!(12)
+}
+fn default_confirm_bars() -> u32 {
+    2
+}
+fn default_cooldown_secs() -> u64 {
+    3600
+}
+fn default_max_recenters_day() -> u32 {
+    4
+}
+fn default_hysteresis() -> Decimal {
+    dec!(10)
+}
+
+impl Default for DynamicGridConfig {
+    fn default() -> Self {
+        Self {
+            atr_interval: default_atr_interval(),
+            atr_period: default_atr_period(),
+            atr_mult: default_atr_mult(),
+            min_half_width_pct: default_min_half_width(),
+            max_half_width_pct: default_max_half_width(),
+            confirm_bars: default_confirm_bars(),
+            recenter_cooldown_secs: default_cooldown_secs(),
+            max_recenters_per_day: default_max_recenters_day(),
+            reentry_hysteresis_pct: default_hysteresis(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +181,10 @@ pub struct GridConfig {
     /// Cross margin when true; isolated when false.
     #[serde(default = "default_cross")]
     pub is_cross: bool,
+    #[serde(default)]
+    pub grid_mode: GridMode,
+    #[serde(default)]
+    pub dynamic: DynamicGridConfig,
 }
 
 fn default_market_kind() -> MarketKind {
@@ -131,12 +232,32 @@ impl GridConfig {
                 "每格名义约 {per_level} USDC，低于交易所最低约 $10。请提高总投入或减少网格数量。"
             )));
         }
+        if matches!(self.grid_mode, GridMode::Dynamic) {
+            let d = &self.dynamic;
+            if d.atr_period < 2 {
+                return Err(GridError::InvalidConfig(
+                    "atr_period must be at least 2".into(),
+                ));
+            }
+            if d.min_half_width_pct <= Decimal::ZERO
+                || d.max_half_width_pct <= d.min_half_width_pct
+            {
+                return Err(GridError::InvalidConfig(
+                    "invalid dynamic half-width bounds".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
     pub fn size_per_level(&self) -> GridResult<Decimal> {
         self.validate()?;
         Ok(self.total_budget / Decimal::from(self.grid_count))
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self.grid_mode, GridMode::Dynamic)
+            || matches!(self.breakout_action, BreakoutAction::Recenter)
     }
 }
 
@@ -156,6 +277,13 @@ pub struct OrderIntent {
     pub price: Decimal,
     pub size: Decimal,
     pub level_index: u32,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub tif: TimeInForce,
+    /// Stable exchange client order id (Hyperliquid cloid), when set.
+    #[serde(default)]
+    pub cloid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +299,10 @@ pub struct LiveOrder {
     #[serde(default)]
     pub orig_size: Decimal,
     pub level_index: u32,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub cloid: Option<String>,
 }
 
 impl LiveOrder {
@@ -192,6 +324,23 @@ impl LiveOrder {
             size,
             orig_size: size,
             level_index,
+            reduce_only: false,
+            cloid: None,
+        }
+    }
+
+    pub fn from_intent(intent: &OrderIntent, exchange_id: Option<String>) -> Self {
+        Self {
+            client_id: intent.client_id.clone(),
+            exchange_id,
+            symbol: intent.symbol.clone(),
+            side: intent.side,
+            price: intent.price,
+            size: intent.size,
+            orig_size: intent.size,
+            level_index: intent.level_index,
+            reduce_only: intent.reduce_only,
+            cloid: intent.cloid.clone(),
         }
     }
 
@@ -213,6 +362,24 @@ pub struct FillEvent {
     pub size: Decimal,
     pub level_index: u32,
     pub fee: Decimal,
+    #[serde(default)]
+    pub fee_token: Option<String>,
+    /// Exchange trade id when known (Hyperliquid tid).
+    #[serde(default)]
+    pub exchange_tid: Option<String>,
+    #[serde(default)]
+    pub exchange_oid: Option<String>,
+    #[serde(default)]
+    pub cloid: Option<String>,
+    /// Exchange fill time in unix ms.
+    #[serde(default)]
+    pub exchange_time_ms: Option<i64>,
+    #[serde(default)]
+    pub crossed: bool,
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default)]
+    pub closed_pnl: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,4 +418,27 @@ pub struct BotSnapshot {
     #[serde(default)]
     pub funding_pnl: Decimal,
     pub events_tail: Vec<String>,
+    /// Active (possibly recentered) lower bound.
+    #[serde(default)]
+    pub active_lower: Option<Decimal>,
+    #[serde(default)]
+    pub active_upper: Option<Decimal>,
+    #[serde(default)]
+    pub atr: Option<Decimal>,
+    #[serde(default)]
+    pub atr_pct: Option<Decimal>,
+    #[serde(default)]
+    pub recenter_generation: u32,
+    #[serde(default)]
+    pub recenters_today: u32,
+    #[serde(default)]
+    pub last_recenter_ms: Option<i64>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub last_tick_ms: Option<i64>,
+    #[serde(default)]
+    pub health_note: Option<String>,
+    #[serde(default)]
+    pub grid_mode: GridMode,
 }

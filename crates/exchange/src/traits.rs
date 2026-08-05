@@ -77,6 +77,29 @@ fn default_max_leverage() -> u32 {
     50
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionSnapshot {
+    pub symbol: String,
+    pub size: Decimal,
+    pub entry_price: Option<Decimal>,
+    pub unrealized_pnl: Option<Decimal>,
+    pub liquidation_price: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CancelReport {
+    pub canceled: usize,
+    pub remaining_oids: Vec<String>,
+    pub confirmed_flat: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconcileReport {
+    pub exchange_orders: Vec<LiveOrder>,
+    pub local_only: Vec<String>,
+    pub exchange_only_oids: Vec<String>,
+}
+
 #[async_trait]
 pub trait Exchange: Send + Sync {
     fn mode(&self) -> RunMode;
@@ -102,6 +125,42 @@ pub trait Exchange: Send + Sync {
 
     async fn cancel_all(&mut self, symbol: &str) -> ExchangeResult<()>;
 
+    /// Cancel symbol orders and poll until exchange reports none remaining.
+    async fn cancel_all_confirmed(
+        &mut self,
+        symbol: &str,
+        max_attempts: u32,
+    ) -> ExchangeResult<CancelReport> {
+        self.cancel_all(symbol).await?;
+        let mut remaining = Vec::new();
+        for attempt in 0..max_attempts.max(1) {
+            let open = self.list_exchange_open_orders(symbol).await?;
+            if open.is_empty() {
+                return Ok(CancelReport {
+                    canceled: 0,
+                    remaining_oids: vec![],
+                    confirmed_flat: true,
+                });
+            }
+            remaining = open
+                .iter()
+                .filter_map(|o| o.exchange_id.clone())
+                .collect();
+            if attempt + 1 < max_attempts {
+                self.cancel_all(symbol).await?;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    200 * (attempt as u64 + 1),
+                ))
+                .await;
+            }
+        }
+        Ok(CancelReport {
+            canceled: 0,
+            remaining_oids: remaining,
+            confirmed_flat: false,
+        })
+    }
+
     /// Close only the net position for `symbol`, leaving other markets untouched.
     async fn close_position(&mut self, symbol: &str) -> ExchangeResult<()>;
 
@@ -114,6 +173,21 @@ pub trait Exchange: Send + Sync {
     async fn drain_fills(&mut self) -> ExchangeResult<Vec<FillEvent>>;
 
     async fn list_open_orders(&self, symbol: &str) -> ExchangeResult<Vec<LiveOrder>>;
+
+    /// Live open orders from the exchange (not just local map).
+    async fn list_exchange_open_orders(&self, symbol: &str) -> ExchangeResult<Vec<LiveOrder>> {
+        self.list_open_orders(symbol).await
+    }
+
+    async fn get_position(&self, symbol: &str) -> ExchangeResult<PositionSnapshot> {
+        Ok(PositionSnapshot {
+            symbol: symbol.to_string(),
+            size: Decimal::ZERO,
+            entry_price: None,
+            unrealized_pnl: None,
+            liquidation_price: None,
+        })
+    }
 
     async fn list_spot_symbols(&self) -> ExchangeResult<Vec<String>>;
 

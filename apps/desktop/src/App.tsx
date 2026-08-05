@@ -11,12 +11,15 @@ import {
   GridLevel,
   GridPreview,
 } from "./lib/api";
+import { botStatusCssClass, botStatusI18nKey, normalizeBotStatusKey } from "./lib/botStatus";
 import { GridChart, ChartTrade, PricePoint } from "./components/GridChart";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { FlattenOverlay } from "./components/FlattenOverlay";
+import { PnlAnalytics } from "./components/PnlAnalytics";
 import { PairScreener } from "./components/PairScreener";
 import i18n from "./i18n";
 
-type Tab = "account" | "configure" | "screener" | "dashboard";
+type Tab = "account" | "configure" | "screener" | "dashboard" | "analytics";
 
 type MarketInfo = {
   symbol: string;
@@ -44,6 +47,14 @@ const defaultForm = {
   maxOrderFailures: 5,
   leverage: 5,
   isCross: true,
+  gridMode: "fixed" as "fixed" | "dynamic",
+  atrInterval: "15m",
+  atrPeriod: 14,
+  atrMult: "1.25",
+  confirmBars: 2,
+  recenterCooldownSecs: 3600,
+  maxRecentersPerDay: 4,
+  autoStart: false,
 };
 
 function suggestRange(mid: number, pctPercent = 5) {
@@ -78,7 +89,40 @@ function formatFundingRate(value?: string | number | null) {
   if (!Number.isFinite(rate)) return "—";
   const percent = rate * 100;
   const sign = percent > 0 ? "+" : "";
-  return `${sign}${percent.toFixed(4)}% / 1h`;
+  return `${sign}${percent.toFixed(4)}%/h`;
+}
+
+/** Hyperliquid perps settle funding on the hour (UTC). */
+function nextFundingTimeMs(nowMs = Date.now()) {
+  const hourMs = 3_600_000;
+  const next = Math.floor(nowMs / hourMs) * hourMs + hourMs;
+  return next;
+}
+
+function formatCountdown(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0:00";
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  if (h > 0) return `${h}:${pad(m)}:${pad(s)}`;
+  return `${m}:${pad(s)}`;
+}
+
+/** Estimated next funding cash flow to the account (positive = receive). */
+function estimateNextFundingUsdc(
+  positionBase?: string | number | null,
+  mid?: string | number | null,
+  fundingRate?: string | number | null,
+) {
+  const size = Number(positionBase ?? 0);
+  const px = Number(mid ?? 0);
+  const rate = Number(fundingRate ?? NaN);
+  if (!Number.isFinite(size) || size === 0) return 0;
+  if (!Number.isFinite(px) || px <= 0 || !Number.isFinite(rate)) return null;
+  // Longs pay when funding > 0 → cash flow = -position * mark * rate
+  return -size * px * rate;
 }
 
 export default function App() {
@@ -133,6 +177,9 @@ export default function App() {
   const [events, setEvents] = useState<any[]>([]);
   const [error, setError] = useState("");
   const [tip, setTip] = useState("");
+  const [stopConfirmOpen, setStopConfirmOpen] = useState(false);
+  const [alertBanner, setAlertBanner] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [configJson, setConfigJson] = useState("");
   const [priceHistory, setPriceHistory] = useState<PricePoint[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -143,6 +190,7 @@ export default function App() {
   const [envPath, setEnvPath] = useState("");
   const settingsReady = useRef(false);
   const skipNextPersist = useRef(false);
+  const autoStartAttempted = useRef(false);
 
   function buildSettingsPayload(): AppSettings {
     return {
@@ -164,6 +212,16 @@ export default function App() {
       chart_mode: chartMode,
       chart_interval: chartInterval,
       range_pct: String(rangePctValue()),
+      grid_mode: form.gridMode,
+      atr_interval: form.atrInterval,
+      atr_period: form.atrPeriod,
+      atr_mult: form.atrMult,
+      confirm_bars: form.confirmBars,
+      recenter_cooldown_secs: form.recenterCooldownSecs,
+      max_recenters_per_day: form.maxRecentersPerDay,
+      auto_start: form.autoStart,
+      resume_on_restart: true,
+      exit_policy: "preserve",
     };
   }
 
@@ -443,6 +501,14 @@ export default function App() {
           maxOrderFailures: settings.max_order_failures || 5,
           leverage: settings.leverage || 5,
           isCross: settings.is_cross !== false,
+          gridMode: settings.grid_mode === "dynamic" ? "dynamic" : "fixed",
+          atrInterval: settings.atr_interval || "15m",
+          atrPeriod: settings.atr_period || 14,
+          atrMult: settings.atr_mult || "1.25",
+          confirmBars: settings.confirm_bars || 2,
+          recenterCooldownSecs: settings.recenter_cooldown_secs || 3600,
+          maxRecentersPerDay: settings.max_recenters_per_day || 4,
+          autoStart: !!settings.auto_start,
         });
         if (settings.chart_mode === "candle" || settings.chart_mode === "line") {
           setChartMode(settings.chart_mode);
@@ -466,10 +532,68 @@ export default function App() {
         window.setTimeout(() => {
           skipNextPersist.current = false;
         }, 800);
-        // Markets/mid after form hydrated from .env — delay past startup flatten traffic.
+        // Markets/mid after form hydrated from .env.
         window.setTimeout(() => {
           void loadMarkets(settings.symbol || "BTC");
         }, 1500);
+
+        // AUTO_START: if no resumable session already running, start with saved config.
+        if (settings.auto_start && !autoStartAttempted.current) {
+          autoStartAttempted.current = true;
+          const gridMode = settings.grid_mode === "dynamic" ? "dynamic" : "fixed";
+          window.setTimeout(() => {
+            void (async () => {
+              try {
+                const live = await api<BotSnapshot | null>("get_status").catch(() => null);
+                const st = String(live?.status || "idle").toLowerCase();
+                const busy = [
+                  "running",
+                  "paused",
+                  "soft_breakout",
+                  "recentering",
+                  "recovering",
+                  "detached",
+                ].includes(st);
+                if (busy) {
+                  if (live) setStatus(live);
+                  setTab("dashboard");
+                  return;
+                }
+                const snap = await api<BotSnapshot>("start_bot", {
+                  req: {
+                    symbol: settings.symbol || "BTC",
+                    lowerPrice: settings.lower_price || "",
+                    upperPrice: settings.upper_price || "",
+                    gridCount: settings.grid_count || 10,
+                    totalBudget: settings.total_budget || "1000",
+                    spacing: settings.spacing || "arithmetic",
+                    breakoutAction:
+                      gridMode === "dynamic"
+                        ? "recenter"
+                        : settings.breakout_action || "cancel_close_and_stop",
+                    maxDrawdownPct: settings.max_drawdown_pct || "20",
+                    maxDailyLoss: settings.max_daily_loss || "100",
+                    maxOrderFailures: settings.max_order_failures || 5,
+                    leverage: settings.leverage || 5,
+                    isCross: settings.is_cross !== false,
+                    gridMode,
+                    atrInterval: settings.atr_interval || "15m",
+                    atrPeriod: settings.atr_period || 14,
+                    atrMult: settings.atr_mult || "1.25",
+                    confirmBars: settings.confirm_bars || 2,
+                    recenterCooldownSecs: settings.recenter_cooldown_secs || 3600,
+                    maxRecentersPerDay: settings.max_recenters_per_day || 4,
+                  },
+                });
+                setStatus(snap);
+                setTab("dashboard");
+              } catch (e) {
+                console.warn("auto_start failed", e);
+                setError(String(e));
+              }
+            })();
+          }, 2200);
+        }
       } catch (e) {
         console.warn(e);
         settingsReady.current = true;
@@ -485,6 +609,13 @@ export default function App() {
     }, 500);
     return () => window.clearTimeout(id);
   }, [persistSettings]);
+
+  useEffect(() => {
+    if (tab !== "dashboard") return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [tab]);
 
   // Markets are loaded after settings hydrate and when the user changes mode
   // in the Account tab — avoid a second mount-time fetch that triggers 429.
@@ -530,6 +661,7 @@ export default function App() {
   useEffect(() => {
     let unlistenStatus: (() => void) | undefined;
     let unlistenEvent: (() => void) | undefined;
+    let unlistenAlert: (() => void) | undefined;
     void (async () => {
       unlistenStatus = await listen<BotSnapshot>("bot-status", (e) => {
         setStatus(e.payload);
@@ -537,6 +669,10 @@ export default function App() {
         if (Number.isFinite(m) && m > 0) {
           setMid(m);
           pushPrice(m);
+        }
+        const st = String(e.payload.status || "").toLowerCase();
+        if (st === "halted" || st === "breakout_stopped") {
+          setAlertBanner(e.payload.status_note || e.payload.health_note || t("app.haltBanner"));
         }
       });
       unlistenEvent = await listen<any>("bot-event", async (e) => {
@@ -553,12 +689,28 @@ export default function App() {
         setFills(await api("list_fills", { limit: 50 }));
         setEvents(await api("list_events", { limit: 50 }));
       });
+      unlistenAlert = await listen<{ kind?: string; reason?: string }>("bot-alert", (e) => {
+        const reason = e.payload?.reason || t("app.haltBanner");
+        setAlertBanner(reason);
+        try {
+          if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+            new Notification(t("app.title"), { body: reason });
+          } else if (typeof Notification !== "undefined" && Notification.permission !== "denied") {
+            void Notification.requestPermission().then((p) => {
+              if (p === "granted") new Notification(t("app.title"), { body: reason });
+            });
+          }
+        } catch {
+          /* ignore notification failures */
+        }
+      });
     })();
     return () => {
       unlistenStatus?.();
       unlistenEvent?.();
+      unlistenAlert?.();
     };
-  }, []);
+  }, [t]);
 
   async function refreshBalances() {
     setError("");
@@ -603,6 +755,60 @@ export default function App() {
     return Number.isFinite(n) && n > 0 ? String(n) : undefined;
   }
 
+  async function refreshDynamicBounds(opts?: {
+    midVal?: number;
+    silent?: boolean;
+  }): Promise<{ lower: string; upper: string; mid: number } | null> {
+    if (form.gridMode !== "dynamic") return null;
+    try {
+      let midVal = opts?.midVal;
+      if (midVal == null || !Number.isFinite(midVal) || midVal <= 0) {
+        const m = await api<string>("get_mid", { symbol: form.symbol });
+        midVal = Number(m);
+        if (Number.isFinite(midVal) && midVal > 0) {
+          setMid(midVal);
+        }
+      }
+      if (midVal == null || !Number.isFinite(midVal) || midVal <= 0) {
+        throw new Error("mid unavailable");
+      }
+      const res = await api<{
+        lowerPrice: string;
+        upperPrice: string;
+        midPrice: string;
+        atr: string;
+        atrPct: string;
+        halfWidthPct: string;
+      }>("estimate_dynamic_bounds", {
+        req: {
+          symbol: form.symbol,
+          atrInterval: form.atrInterval,
+          atrPeriod: form.atrPeriod,
+          atrMult: form.atrMult,
+          midPrice: String(midVal),
+        },
+      });
+      // Tauri may return snake_case depending on serde; accept both.
+      const lower = (res as any).lowerPrice ?? (res as any).lower_price;
+      const upper = (res as any).upperPrice ?? (res as any).upper_price;
+      const half =
+        Number((res as any).halfWidthPct ?? (res as any).half_width_pct) || 0;
+      setForm((f) => ({
+        ...f,
+        lowerPrice: String(lower),
+        upperPrice: String(upper),
+      }));
+      if (half > 0) {
+        // Full width % ≈ 2 × half-width for the fit-range display.
+        setRangePct(String(Number((half * 2).toFixed(1))));
+      }
+      return { lower: String(lower), upper: String(upper), mid: midVal };
+    } catch (e: any) {
+      if (!opts?.silent) setError(String(e));
+      return null;
+    }
+  }
+
   async function doPreview() {
     setError("");
     try {
@@ -610,13 +816,22 @@ export default function App() {
       const m = await api<string>("get_mid", { symbol: form.symbol });
       const midVal = Number(m);
       setMid(midVal);
+      let lower = form.lowerPrice;
+      let upper = form.upperPrice;
+      if (form.gridMode === "dynamic") {
+        const dyn = await refreshDynamicBounds({ midVal, silent: false });
+        if (dyn) {
+          lower = dyn.lower;
+          upper = dyn.upper;
+        }
+      }
       const equity = accountEquityUsdc();
       const maxLev = selectedMarket?.max_leverage;
       const p = await api<GridPreview>("preview_grid_cmd", {
         req: {
           symbol: form.symbol,
-          lowerPrice: form.lowerPrice,
-          upperPrice: form.upperPrice,
+          lowerPrice: lower,
+          upperPrice: upper,
           gridCount: form.gridCount,
           totalBudget: form.totalBudget,
           spacing: form.spacing,
@@ -641,12 +856,53 @@ export default function App() {
     }
   }
 
+  // Keep configure bounds aligned with ATR (or live active band while running).
+  useEffect(() => {
+    if (!settingsReady.current || form.gridMode !== "dynamic") return;
+    const st = normalizeBotStatusKey(status?.status);
+    const liveBand =
+      status?.active_lower != null &&
+      status?.active_upper != null &&
+      ["running", "paused", "soft_breakout", "recentering", "recovering"].includes(st);
+    if (liveBand) {
+      const lo = String(status!.active_lower);
+      const hi = String(status!.active_upper);
+      setForm((f) =>
+        f.lowerPrice === lo && f.upperPrice === hi
+          ? f
+          : { ...f, lowerPrice: lo, upperPrice: hi },
+      );
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void refreshDynamicBounds({ silent: true });
+    }, 400);
+    return () => window.clearTimeout(timer);
+    // refreshDynamicBounds closes over latest form ATR fields
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    form.gridMode,
+    form.symbol,
+    form.atrInterval,
+    form.atrPeriod,
+    form.atrMult,
+    status?.status,
+    status?.active_lower,
+    status?.active_upper,
+  ]);
+
   async function start() {
     setError("");
     setTip("");
     const live = status ?? (await api<BotSnapshot | null>("get_status").catch(() => null));
     const st = String(live?.status || "").toLowerCase();
-    if (st === "running" || st === "paused") {
+    if (
+      st === "running" ||
+      st === "paused" ||
+      st === "soft_breakout" ||
+      st === "recentering" ||
+      st === "recovering"
+    ) {
       setTip(t("app.alreadyRunningTip"));
       setTab("dashboard");
       return;
@@ -658,20 +914,37 @@ export default function App() {
       setCandles([]);
       setPriceHistory([]);
       void loadCandles(form.symbol, chartInterval);
+      let lowerPrice = form.lowerPrice;
+      let upperPrice = form.upperPrice;
+      if (form.gridMode === "dynamic") {
+        const dyn = await refreshDynamicBounds({ silent: false });
+        if (dyn) {
+          lowerPrice = dyn.lower;
+          upperPrice = dyn.upper;
+        }
+      }
       const snap = await api<BotSnapshot>("start_bot", {
         req: {
           symbol: form.symbol,
-          lowerPrice: form.lowerPrice,
-          upperPrice: form.upperPrice,
+          lowerPrice,
+          upperPrice,
           gridCount: form.gridCount,
           totalBudget: form.totalBudget,
           spacing: form.spacing,
-          breakoutAction: form.breakoutAction,
+          breakoutAction:
+            form.gridMode === "dynamic" ? "recenter" : form.breakoutAction,
           maxDrawdownPct: form.maxDrawdownPct,
           maxDailyLoss: form.maxDailyLoss,
           maxOrderFailures: form.maxOrderFailures,
           leverage: form.leverage,
           isCross: form.isCross,
+          gridMode: form.gridMode,
+          atrInterval: form.atrInterval,
+          atrPeriod: form.atrPeriod,
+          atrMult: form.atrMult,
+          confirmBars: form.confirmBars,
+          recenterCooldownSecs: form.recenterCooldownSecs,
+          maxRecentersPerDay: form.maxRecentersPerDay,
         },
       });
       setStatus(snap);
@@ -730,26 +1003,11 @@ export default function App() {
   }
 
   function botStatusLabel(raw?: string | null) {
-    const key = String(raw || "idle").toLowerCase();
-    const map: Record<string, string> = {
-      idle: "app.statusIdle",
-      running: "app.statusRunning",
-      paused: "app.statusPaused",
-      protective_exit: "app.statusProtectiveExit",
-      breakout_stopped: "app.statusBreakoutStopped",
-      halted: "app.statusHalted",
-    };
-    return t(map[key] || "app.statusIdle");
+    return t(botStatusI18nKey(raw));
   }
 
   function botStatusClass(raw?: string | null) {
-    const key = String(raw || "idle").toLowerCase();
-    if (key === "running") return "status-running";
-    if (key === "paused") return "status-paused";
-    if (key === "halted" || key === "protective_exit" || key === "breakout_stopped") {
-      return "status-halted";
-    }
-    return "status-idle";
+    return botStatusCssClass(raw);
   }
 
   function positionSideClass(position?: string | null) {
@@ -840,11 +1098,41 @@ export default function App() {
   return (
     <div className="app">
       <FlattenOverlay />
+      <ConfirmDialog
+        open={stopConfirmOpen}
+        title={t("app.stopConfirmTitle")}
+        message={t("app.stopConfirm")}
+        cancelLabel={t("app.dialogCancel")}
+        confirmLabel={t("app.dialogConfirm")}
+        danger
+        onCancel={() => setStopConfirmOpen(false)}
+        onConfirm={() => {
+          setStopConfirmOpen(false);
+          void (async () => {
+            setError("");
+            try {
+              setStatus(await api<BotSnapshot>("stop_bot"));
+              setAlertBanner(null);
+            } catch (e: any) {
+              setError(String(e));
+            }
+          })();
+        }}
+      />
+      {alertBanner && (
+        <div className="halt-banner" role="alert">
+          <strong>{t("app.haltBannerTitle")}</strong>
+          <span>{alertBanner}</span>
+          <button type="button" onClick={() => setAlertBanner(null)}>
+            {t("app.dismiss")}
+          </button>
+        </div>
+      )}
       <header className="top">
         <div className="top-left">
           <div className="brand">{t("app.title")}</div>
           <nav className="tabs">
-            {(["account", "configure", "screener", "dashboard"] as Tab[]).map((id) => (
+            {(["account", "configure", "screener", "dashboard", "analytics"] as Tab[]).map((id) => (
               <button
                 key={id}
                 type="button"
@@ -1197,43 +1485,97 @@ export default function App() {
                   </button>
                 </div>
                 <div className="fit-range-row">
-                  <span className="fit-range-prefix">{t("app.fitRangePrefix")}</span>
-                  <input
-                    type="number"
-                    className="fit-range-input"
-                    min={0}
-                    max={90}
-                    step={0.5}
-                    value={rangePct}
-                    onChange={(e) => setRangePct(e.target.value)}
-                    aria-label={t("app.fitRangePct")}
-                  />
-                  <span className="fit-range-suffix">%</span>
-                  <button
-                    type="button"
-                    className="mid-action"
-                    onClick={() => applyRangeFromMid(mid)}
-                  >
-                    {t("app.fitRangeApply")}
-                  </button>
+                  <span className="fit-range-prefix">
+                    {form.gridMode === "dynamic"
+                      ? t("app.dynamicFitRangeHint")
+                      : t("app.fitRangePrefix")}
+                  </span>
+                  {form.gridMode !== "dynamic" && (
+                    <>
+                      <input
+                        type="number"
+                        className="fit-range-input"
+                        min={0}
+                        max={90}
+                        step={0.5}
+                        value={rangePct}
+                        onChange={(e) => setRangePct(e.target.value)}
+                        aria-label={t("app.fitRangePct")}
+                      />
+                      <span className="fit-range-suffix">%</span>
+                      <button
+                        type="button"
+                        className="mid-action"
+                        onClick={() => applyRangeFromMid(mid)}
+                      >
+                        {t("app.fitRangeApply")}
+                      </button>
+                    </>
+                  )}
+                  {form.gridMode === "dynamic" && (
+                    <button
+                      type="button"
+                      className="mid-action"
+                      onClick={() => void refreshDynamicBounds({ midVal: mid || undefined })}
+                    >
+                      {t("app.dynamicBoundsRefresh")}
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
+            <label
+              className={
+                form.gridMode === "dynamic"
+                  ? "mode-toggle mode-toggle-on"
+                  : "mode-toggle"
+              }
+            >
+              <span className="mode-toggle-copy">
+                <span className="mode-toggle-title">{t("app.dynamicGrid")}</span>
+                <span className="mode-toggle-help">{t("app.dynamicGridHelp")}</span>
+              </span>
+              <input
+                type="checkbox"
+                className="mode-toggle-input"
+                checked={form.gridMode === "dynamic"}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setForm({
+                    ...form,
+                    gridMode: on ? "dynamic" : "fixed",
+                    breakoutAction: on ? "recenter" : form.breakoutAction,
+                  });
+                  if (on) {
+                    window.setTimeout(() => {
+                      void refreshDynamicBounds({ silent: true });
+                    }, 50);
+                  }
+                }}
+              />
+              <span className="mode-toggle-switch" aria-hidden="true" />
+            </label>
             <label>
               {t("app.lowerPrice")}
               <input
                 value={form.lowerPrice}
+                disabled={form.gridMode === "dynamic"}
                 onChange={(e) => setForm({ ...form, lowerPrice: e.target.value })}
               />
-              <small>{t("app.lowerHelp")}</small>
+              <small>
+                {form.gridMode === "dynamic" ? t("app.dynamicBoundsHint") : t("app.lowerHelp")}
+              </small>
             </label>
             <label>
               {t("app.upperPrice")}
               <input
                 value={form.upperPrice}
+                disabled={form.gridMode === "dynamic"}
                 onChange={(e) => setForm({ ...form, upperPrice: e.target.value })}
               />
-              <small>{t("app.upperHelp")}</small>
+              <small>
+                {form.gridMode === "dynamic" ? t("app.dynamicBoundsHint") : t("app.upperHelp")}
+              </small>
             </label>
             <label>
               {t("app.gridCount")}
@@ -1364,13 +1706,15 @@ export default function App() {
                 <label>
                   {t("app.breakout")}
                   <select
-                    value={form.breakoutAction}
+                    value={form.gridMode === "dynamic" ? "recenter" : form.breakoutAction}
+                    disabled={form.gridMode === "dynamic"}
                     onChange={(e) => setForm({ ...form, breakoutAction: e.target.value })}
                   >
                     <option value="alert_only">{t("app.alertOnly")}</option>
                     <option value="pause">{t("app.breakoutPause")}</option>
                     <option value="cancel_and_pause">{t("app.cancelOrdersKeepPosition")}</option>
                     <option value="cancel_close_and_stop">{t("app.cancelCloseAndStop")}</option>
+                    <option value="recenter">{t("app.breakoutRecenter")}</option>
                   </select>
                 </label>
                 <label>
@@ -1403,6 +1747,97 @@ export default function App() {
                 </label>
               </div>
               <details className="advanced config-import">
+                <summary>{t("app.dynamicAdvanced")}</summary>
+                <div className="config-secondary-grid">
+                  <label>
+                    {t("app.atrInterval")}
+                    <select
+                      value={form.atrInterval}
+                      onChange={(e) => setForm({ ...form, atrInterval: e.target.value })}
+                    >
+                      <option value="5m">5m</option>
+                      <option value="15m">15m</option>
+                      <option value="1h">1h</option>
+                      <option value="4h">4h</option>
+                    </select>
+                  </label>
+                  <label>
+                    {t("app.atrPeriod")}
+                    <input
+                      type="number"
+                      min={2}
+                      value={form.atrPeriod}
+                      onChange={(e) =>
+                        setForm({ ...form, atrPeriod: Number(e.target.value) || 14 })
+                      }
+                    />
+                  </label>
+                  <label>
+                    {t("app.atrMult")}
+                    <input
+                      value={form.atrMult}
+                      onChange={(e) => setForm({ ...form, atrMult: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    {t("app.confirmBars")}
+                    <input
+                      type="number"
+                      min={1}
+                      value={form.confirmBars}
+                      onChange={(e) =>
+                        setForm({ ...form, confirmBars: Number(e.target.value) || 2 })
+                      }
+                    />
+                  </label>
+                  <label>
+                    {t("app.recenterCooldown")}
+                    <input
+                      type="number"
+                      min={0}
+                      value={form.recenterCooldownSecs}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          recenterCooldownSecs: Number(e.target.value) || 0,
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    {t("app.maxRecentersPerDay")}
+                    <input
+                      type="number"
+                      min={1}
+                      value={form.maxRecentersPerDay}
+                      onChange={(e) =>
+                        setForm({
+                          ...form,
+                          maxRecentersPerDay: Number(e.target.value) || 1,
+                        })
+                      }
+                    />
+                  </label>
+                  <label
+                    className={
+                      form.autoStart ? "mode-toggle mode-toggle-on" : "mode-toggle"
+                    }
+                  >
+                    <span className="mode-toggle-copy">
+                      <span className="mode-toggle-title">{t("app.autoStart")}</span>
+                      <span className="mode-toggle-help">{t("app.autoStartHelp")}</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      className="mode-toggle-input"
+                      checked={form.autoStart}
+                      onChange={(e) => setForm({ ...form, autoStart: e.target.checked })}
+                    />
+                    <span className="mode-toggle-switch" aria-hidden="true" />
+                  </label>
+                </div>
+              </details>
+              <details className="advanced config-import">
                 <summary>{t("app.importExport")}</summary>
                 <div className="row">
                   <button
@@ -1422,6 +1857,13 @@ export default function App() {
                           max_order_failures: form.maxOrderFailures,
                           leverage: form.leverage,
                           is_cross: form.isCross,
+                          grid_mode: form.gridMode,
+                          atr_interval: form.atrInterval,
+                          atr_period: form.atrPeriod,
+                          atr_mult: form.atrMult,
+                          confirm_bars: form.confirmBars,
+                          recenter_cooldown_secs: form.recenterCooldownSecs,
+                          max_recenters_per_day: form.maxRecentersPerDay,
                         },
                       });
                       setConfigJson(json);
@@ -1440,6 +1882,15 @@ export default function App() {
                         lowerPrice: cfg.lower_price,
                         upperPrice: cfg.upper_price,
                         gridCount: cfg.grid_count,
+                        gridMode: cfg.grid_mode === "dynamic" ? "dynamic" : form.gridMode,
+                        atrInterval: cfg.atr_interval || form.atrInterval,
+                        atrPeriod: cfg.atr_period || form.atrPeriod,
+                        atrMult: cfg.atr_mult || form.atrMult,
+                        confirmBars: cfg.confirm_bars || form.confirmBars,
+                        recenterCooldownSecs:
+                          cfg.recenter_cooldown_secs || form.recenterCooldownSecs,
+                        maxRecentersPerDay:
+                          cfg.max_recenters_per_day || form.maxRecentersPerDay,
                         totalBudget: cfg.total_budget,
                         spacing: cfg.spacing,
                         breakoutAction: cfg.breakout_action,
@@ -1520,6 +1971,62 @@ export default function App() {
                   <div className={`metric-note ${meta.className}`}>{meta.text}</div>
                 );
               })()}
+              {status?.health_note && (
+                <div className="metric-note metric-note-warning">{status.health_note}</div>
+              )}
+              {status?.last_tick_ms != null && (
+                <div className="metric-item metric-item-tick">
+                  <span className="stat-label">{t("app.lastTick")}</span>
+                  <span className="stat-value stat-value-tick">
+                    {(() => {
+                      const d = new Date(Number(status.last_tick_ms));
+                      if (Number.isNaN(d.getTime())) return "—";
+                      const pad = (n: number) => String(n).padStart(2, "0");
+                      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+                    })()}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="metric-group">
+              <span className="metric-group-title">{t("app.activeBand")}</span>
+              <div className="band-range">
+                <span className="band-chip band-chip-lower">
+                  <span className="band-chip-label">{t("app.lowerPrice")}</span>
+                  <span className="band-chip-value">
+                    {status?.active_lower != null ? fmtNum(status.active_lower, 4) : "—"}
+                  </span>
+                </span>
+                <span className="band-range-sep" aria-hidden="true">
+                  →
+                </span>
+                <span className="band-chip band-chip-upper">
+                  <span className="band-chip-label">{t("app.upperPrice")}</span>
+                  <span className="band-chip-value">
+                    {status?.active_upper != null ? fmtNum(status.active_upper, 4) : "—"}
+                  </span>
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.atr")}</span>
+                <span className="stat-value">
+                  {status?.atr != null
+                    ? `${fmtNum(status.atr, 1)}${
+                        status.atr_pct != null ? ` (${fmtNum(status.atr_pct, 1)}%)` : ""
+                      }`
+                    : "—"}
+                </span>
+              </div>
+              <div className="metric-item">
+                <span className="stat-label">{t("app.recentersToday")}</span>
+                <span className="stat-value">
+                  {status?.recenters_today ?? 0}
+                  {status?.recenter_generation
+                    ? ` · #${status.recenter_generation}`
+                    : ""}
+                </span>
+              </div>
             </div>
 
             <div className="metric-group">
@@ -1576,17 +2083,52 @@ export default function App() {
             <div className="metric-group">
               <span className="metric-group-title">{t("app.fundingMetrics")}</span>
               <div className="metric-item">
-                <span className="stat-label">{t("app.fundingRate")}</span>
-                <span className="stat-value">
+                <span className="stat-label" title={t("app.fundingRateHelp")}>
+                  {t("app.fundingRateShort")}
+                </span>
+                <span className="stat-value stat-value-nowrap">
                   {formatFundingRate(selectedMarket?.funding_rate)}
                 </span>
               </div>
               <div className="metric-item">
-                <span className="stat-label">{t("app.fundingPnl")}</span>
-                <span className={`stat-value ${pnlClass(status?.funding_pnl)}`}>
-                  {fmtNum(status?.funding_pnl, 6)} USDC
+                <span className="stat-label" title={t("app.fundingPnl")}>
+                  {t("app.fundingPnlShort")}
+                </span>
+                <span className={`stat-value stat-value-nowrap ${pnlClass(status?.funding_pnl)}`}>
+                  {fmtNum(status?.funding_pnl, 4)}
                 </span>
               </div>
+              {(() => {
+                const nextAt = nextFundingTimeMs(nowMs);
+                const eta = formatCountdown(nextAt - nowMs);
+                const est = estimateNextFundingUsdc(
+                  status?.position_base,
+                  status?.mid_price ?? mid,
+                  selectedMarket?.funding_rate,
+                );
+                const estText =
+                  est == null
+                    ? "—"
+                    : `${est > 0 ? "+" : ""}${fmtNum(est, 4)}`;
+                return (
+                  <div className="metric-item metric-item-tick">
+                    <span
+                      className="stat-label"
+                      title={t("app.nextFundingHelp")}
+                    >
+                      {t("app.nextFunding")}
+                    </span>
+                    <span
+                      className={`stat-value stat-value-tick ${
+                        est == null || est === 0 ? "" : pnlClass(String(est))
+                      }`}
+                    >
+                      {estText}
+                      <span className="funding-eta"> · {eta}</span>
+                    </span>
+                  </div>
+                );
+              })()}
             </div>
           </div>
           <GridChart
@@ -1626,27 +2168,16 @@ export default function App() {
             <button
               type="button"
               className="btn-danger"
-              onClick={async () => {
-                setError("");
-                try {
-                  setStatus(await api<BotSnapshot>("stop_bot"));
-                } catch (e: any) {
-                  setError(String(e));
-                }
-              }}
+              onClick={() => setStopConfirmOpen(true)}
             >
-              {t("app.stop")}
+              {t("app.stopFlatten")}
             </button>
             <button
               type="button"
               className="btn-info"
-              onClick={async () => {
-                const path = `fills-${Date.now()}.csv`;
-                await api("export_fills_csv", { path });
-                alert(`exported ${path}`);
-              }}
+              onClick={() => setTab("analytics")}
             >
-              {t("app.exportCsv")}
+              {t("app.analytics")}
             </button>
             <button
               type="button"
@@ -1686,6 +2217,20 @@ export default function App() {
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {tab === "analytics" && (
+        <section className="panel analytics-panel">
+          <PnlAnalytics
+            active
+            sessionId={status?.session_id}
+            unrealized={status?.unrealized_pnl}
+            onTip={setTip}
+            onError={setError}
+            fmtNum={fmtNum}
+            pnlClass={pnlClass}
+          />
         </section>
       )}
     </div>

@@ -1,5 +1,6 @@
+mod runner;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use exchange::{
@@ -7,29 +8,33 @@ use exchange::{
     Exchange, HyperliquidExchange, MarketInfo, SimExchange,
 };
 use grid_engine::{
-    preview_grid_with_options, BotSnapshot, BreakoutAction, GridConfig, GridEngine, GridPreview,
-    GridSpacing,
-    MarketKind, RunMode,
+    preview_grid_with_options, BotSnapshot, BreakoutAction, DynamicGridConfig, GridConfig,
+    GridEngine, GridMode, GridPreview, GridSpacing, MarketKind, RunMode,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use storage::{AppConfig, EventRow, FillRow, Storage};
+use storage::{
+    resolve_data_dir, AppConfig, DailyPnlRow, EquitySnapshotRow, EventRow, FillRow,
+    SessionListItem, SessionPnlSummary, Storage,
+};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-/// Skip duplicate flatten when window close already flattened.
-static EXIT_FLATTEN_DONE: AtomicBool = AtomicBool::new(false);
+use runner::{
+    build_grid_config, detach_on_exit, idle_snapshot, protect_symbol, resolve_dynamic_bounds,
+    run_loop, try_resume_active_session,
+};
 
-struct AppState {
-    storage: Storage,
-    engine: Option<GridEngine>,
-    sim: Option<SimExchange>,
-    hl: Option<HyperliquidExchange>,
-    mode: RunMode,
-    private_key: String,
-    address: Option<String>,
-    running_task: bool,
+pub struct AppState {
+    pub storage: Storage,
+    pub engine: Option<GridEngine>,
+    pub sim: Option<SimExchange>,
+    pub hl: Option<HyperliquidExchange>,
+    pub mode: RunMode,
+    pub private_key: String,
+    pub address: Option<String>,
+    pub running_task: bool,
 }
 
 impl AppState {
@@ -105,6 +110,20 @@ struct StartRequest {
     leverage: u32,
     #[serde(default = "default_cross_req")]
     is_cross: bool,
+    #[serde(default)]
+    grid_mode: Option<String>,
+    #[serde(default)]
+    atr_interval: Option<String>,
+    #[serde(default)]
+    atr_period: Option<u32>,
+    #[serde(default)]
+    atr_mult: Option<String>,
+    #[serde(default)]
+    confirm_bars: Option<u32>,
+    #[serde(default)]
+    recenter_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    max_recenters_per_day: Option<u32>,
 }
 
 fn default_leverage_req() -> u32 {
@@ -123,16 +142,6 @@ fn spacing(s: &str) -> GridSpacing {
         GridSpacing::Geometric
     } else {
         GridSpacing::Arithmetic
-    }
-}
-
-fn breakout(s: &str) -> BreakoutAction {
-    match s {
-        "alert_only" => BreakoutAction::AlertOnly,
-        "pause" => BreakoutAction::Pause,
-        "cancel_and_pause" => BreakoutAction::CancelAndPause,
-        "cancel_close_and_stop" => BreakoutAction::CancelCloseAndStop,
-        _ => BreakoutAction::CancelCloseAndStop,
     }
 }
 
@@ -157,6 +166,8 @@ async fn preview_grid_cmd(req: PreviewRequest) -> Result<GridPreview, String> {
         market: MarketKind::Perp,
         leverage: req.leverage,
         is_cross: req.is_cross,
+        grid_mode: GridMode::Fixed,
+        dynamic: DynamicGridConfig::default(),
     };
     let mid = dec(&req.mid_price)?;
     let equity = match req.account_equity.as_deref() {
@@ -164,6 +175,93 @@ async fn preview_grid_cmd(req: PreviewRequest) -> Result<GridPreview, String> {
         _ => None,
     };
     preview_grid_with_options(&config, mid, equity, req.max_leverage).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EstimateDynamicBoundsRequest {
+    symbol: String,
+    #[serde(default)]
+    atr_interval: Option<String>,
+    #[serde(default)]
+    atr_period: Option<u32>,
+    #[serde(default)]
+    atr_mult: Option<String>,
+    #[serde(default)]
+    mid_price: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EstimateDynamicBoundsResponse {
+    lower_price: String,
+    upper_price: String,
+    mid_price: String,
+    atr: String,
+    atr_pct: String,
+    half_width_pct: String,
+}
+
+#[tauri::command]
+async fn estimate_dynamic_bounds(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    req: EstimateDynamicBoundsRequest,
+) -> Result<EstimateDynamicBoundsResponse, String> {
+    let st = state.lock().await;
+    let mid = match req.mid_price.as_deref() {
+        Some(s) if !s.trim().is_empty() => dec(s)?,
+        _ => fetch_live_mid(st.mode, &req.symbol)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    let atr_interval = req
+        .atr_interval
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "1h".into());
+    let atr_period = req.atr_period.unwrap_or(14).max(2);
+    let atr_mult = req
+        .atr_mult
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(dec)
+        .transpose()?
+        .unwrap_or_else(|| Decimal::new(125, 2)); // 1.25
+    let mut config = GridConfig {
+        symbol: req.symbol.clone(),
+        lower_price: Decimal::ZERO,
+        upper_price: Decimal::ZERO,
+        grid_count: 10,
+        total_budget: Decimal::ONE,
+        spacing: GridSpacing::Arithmetic,
+        breakout_action: BreakoutAction::Recenter,
+        max_drawdown_pct: Decimal::ZERO,
+        max_daily_loss: Decimal::ZERO,
+        max_order_failures: 5,
+        market: MarketKind::Perp,
+        leverage: 5,
+        is_cross: true,
+        grid_mode: GridMode::Dynamic,
+        dynamic: DynamicGridConfig {
+            atr_interval,
+            atr_period,
+            atr_mult,
+            ..DynamicGridConfig::default()
+        },
+    };
+    let metrics = resolve_dynamic_bounds(st.mode, &mut config, mid)
+        .await?
+        .ok_or_else(|| "dynamic bounds unavailable".to_string())?;
+    let half = grid_engine::suggest_half_width_pct(metrics.atr_pct, config.dynamic.atr_mult)
+        .max(config.dynamic.min_half_width_pct)
+        .min(config.dynamic.max_half_width_pct);
+    Ok(EstimateDynamicBoundsResponse {
+        lower_price: config.lower_price.normalize().to_string(),
+        upper_price: config.upper_price.normalize().to_string(),
+        mid_price: mid.normalize().to_string(),
+        atr: metrics.atr.normalize().to_string(),
+        atr_pct: metrics.atr_pct.normalize().to_string(),
+        half_width_pct: half.normalize().to_string(),
+    })
 }
 
 #[tauri::command]
@@ -259,7 +357,9 @@ async fn get_account(state: State<'_, Arc<Mutex<AppState>>>) -> Result<serde_jso
             vec![]
         }
     } else if let Some(hl) = st.hl.as_mut() {
-        let _ = hl.connect().await;
+        // Do not full-refresh meta on every balance poll — a partial HIP-3 failure
+        // used to wipe xyz:* from asset_index and break live place/cancel.
+        let _ = hl.ensure_connected().await;
         hl.get_balances().await.unwrap_or_default()
     } else {
         vec![]
@@ -381,28 +481,45 @@ async fn start_bot(
         if st.mode != RunMode::Simulation && st.private_key.trim().is_empty() {
             return Err("private key required for testnet/mainnet".into());
         }
-        let config = GridConfig {
+        let app_cfg = st.storage.load_config().map_err(|e| e.to_string())?;
+        let runner_req = runner::StartRequest {
             symbol: req.symbol.clone(),
-            lower_price: dec(&req.lower_price)?,
-            upper_price: dec(&req.upper_price)?,
+            lower_price: req.lower_price.clone(),
+            upper_price: req.upper_price.clone(),
             grid_count: req.grid_count,
-            total_budget: dec(&req.total_budget)?,
-            spacing: spacing(&req.spacing),
-            breakout_action: breakout(&req.breakout_action),
-            max_drawdown_pct: dec(&req.max_drawdown_pct).unwrap_or(Decimal::ZERO),
-            max_daily_loss: dec(&req.max_daily_loss).unwrap_or(Decimal::ZERO),
+            total_budget: req.total_budget.clone(),
+            spacing: req.spacing.clone(),
+            breakout_action: req.breakout_action.clone(),
+            max_drawdown_pct: req.max_drawdown_pct.clone(),
+            max_daily_loss: req.max_daily_loss.clone(),
             max_order_failures: req.max_order_failures,
-            market: MarketKind::Perp,
-            leverage: req.leverage.max(1).min(50),
+            leverage: req.leverage,
             is_cross: req.is_cross,
+            grid_mode: req.grid_mode.clone(),
+            atr_interval: req.atr_interval.clone(),
+            atr_period: req.atr_period,
+            atr_mult: req.atr_mult.clone(),
+            confirm_bars: req.confirm_bars,
+            recenter_cooldown_secs: req.recenter_cooldown_secs,
+            max_recenters_per_day: req.max_recenters_per_day,
         };
+        let mut config = build_grid_config(&runner_req, &app_cfg)?;
         let mid = if st.mode == RunMode::Simulation {
             let live = fetch_live_mid(st.mode, &config.symbol)
                 .await
-                .unwrap_or_else(|_| (config.lower_price + config.upper_price) / Decimal::from(2));
+                .unwrap_or_else(|_| {
+                    if config.lower_price > Decimal::ZERO && config.upper_price > config.lower_price {
+                        (config.lower_price + config.upper_price) / Decimal::from(2)
+                    } else {
+                        Decimal::from(100_000)
+                    }
+                });
+            if config.is_dynamic() {
+                resolve_dynamic_bounds(RunMode::Testnet, &mut config, live).await?;
+            }
             if live <= config.lower_price || live >= config.upper_price {
                 return Err(format!(
-                    "当前中间价 {live} 不在网格区间 {}–{} 内，请重新设置区间",
+                    "当前中间价 {live} 不在网格区间 {}–{} 内，请重新设置区间或启用动态模式",
                     config.lower_price, config.upper_price
                 ));
             }
@@ -422,11 +539,10 @@ async fn start_bot(
                 .connect()
                 .await
                 .map_err(|e| e.to_string())?;
-            // Clear leftovers first (overlay only covers this brief step).
-            flatten_account_notify(&app, &mut st, "start")
+            // Cancel sim leftovers for this symbol only (preserve other state).
+            protect_symbol(&mut st, &config.symbol, false)
                 .await
-                .map_err(|e| format!("启动前撤单/平仓失败: {e}"))?;
-            // Flatten resets base; keep the oscillation band.
+                .map_err(|e| format!("启动前撤单失败: {e}"))?;
             if let Some(sim) = st.sim.as_ref() {
                 sim.set_band(config.lower_price, config.upper_price).await;
             }
@@ -451,16 +567,19 @@ async fn start_bot(
                 .get_mid(&config.symbol)
                 .await
                 .map_err(|e| e.to_string())?;
+            if config.is_dynamic() {
+                resolve_dynamic_bounds(st.mode, &mut config, live_mid).await?;
+            }
             if live_mid <= config.lower_price || live_mid >= config.upper_price {
                 return Err(format!(
-                    "当前中间价 {live_mid} 不在网格区间 {}–{} 内，请重新设置区间",
+                    "当前中间价 {live_mid} 不在网格区间 {}–{} 内，请重新设置区间或启用动态模式",
                     config.lower_price, config.upper_price
                 ));
             }
-            // Clear leftovers first (overlay only covers this brief step).
-            flatten_account_notify(&app, &mut st, "start")
+            // Cancel only this strategy symbol — never flatten the whole account.
+            protect_symbol(&mut st, &config.symbol, false)
                 .await
-                .map_err(|e| format!("启动前撤单/平仓失败: {e}"))?;
+                .map_err(|e| format!("启动前撤销本币种挂单失败: {e}"))?;
             let hl = st.hl.as_mut().unwrap();
             hl.set_leverage(&config.symbol, config.leverage, config.is_cross)
                 .await
@@ -509,6 +628,17 @@ async fn start_bot(
         for order in placed {
             engine.register_live_order(order);
         }
+        let sid = engine.session_id().to_string();
+        let cfg_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".into());
+        let _ = st.storage.upsert_bot_session(
+            &sid,
+            "grid",
+            &config.symbol,
+            "running",
+            &cfg_json,
+            true,
+        );
+        runner::persist_checkpoint(&st.storage, &engine, "started");
         let snap = engine.snapshot();
         st.engine = Some(engine);
         st.running_task = true;
@@ -519,292 +649,15 @@ async fn start_bot(
     let app2 = app.clone();
     let state2 = state_arc.clone();
     tauri::async_runtime::spawn(async move {
-        let mut funding_poll_tick: u32 = 0;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            let mut st = state2.lock().await;
-            if !st.running_task || st.engine.is_none() {
-                break;
-            }
-            let symbol = st.engine.as_ref().unwrap().config.symbol.clone();
-            let mid = if st.mode == RunMode::Simulation {
-                match st.sim.as_mut().unwrap().get_mid(&symbol).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("sim mid: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                match st.hl.as_mut().unwrap().get_mid(&symbol).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("hl mid: {e}");
-                        continue;
-                    }
-                }
-            };
-
-            let breakout_events = st.engine.as_mut().unwrap().on_mid_price(mid);
-            let protective_exit = breakout_events.iter().find_map(|event| match event {
-                grid_engine::EngineEvent::ProtectiveExitRequested {
-                    close_position,
-                    risk_triggered,
-                    ..
-                } => Some((*close_position, *risk_triggered)),
-                _ => None,
-            });
-            for ev in &breakout_events {
-                let _ = app2.emit("bot-event", &ev);
-            }
-            if let Some((close_position, risk_triggered)) = protective_exit {
-                let result = protect_symbol(&mut st, &symbol, close_position).await;
-                match result {
-                    Ok(()) => {
-                        if let Some(engine) = st.engine.as_mut() {
-                            if risk_triggered {
-                                engine.mark_risk_stopped("strategy equity risk limit reached");
-                            } else if close_position {
-                                engine.mark_breakout_stopped();
-                            } else {
-                                engine.mark_orders_canceled_and_paused();
-                            }
-                        }
-                        st.running_task = false;
-                        let _ = st.storage.record_event(
-                            if risk_triggered {
-                                "risk_protection"
-                            } else {
-                                "breakout_protection"
-                            },
-                            if risk_triggered {
-                                "strategy equity limit reached; orders canceled and position closed"
-                            } else if close_position {
-                                "symbol orders canceled and position closed"
-                            } else {
-                                "symbol orders canceled; position retained"
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        if let Some(engine) = st.engine.as_mut() {
-                            engine.mark_protective_exit_failed(&e);
-                        }
-                        st.running_task = false;
-                        let _ = st.storage.record_event("breakout_protection_failed", &e);
-                        let _ = app2.emit(
-                            "bot-event",
-                            &grid_engine::EngineEvent::Halted {
-                                reason: format!("protective exit failed: {e}"),
-                            },
-                        );
-                    }
-                }
-                if let Some(engine) = st.engine.as_ref() {
-                    let _ = app2.emit("bot-status", &engine.snapshot());
-                }
-                break;
-            }
-
-            let fills = if st.mode == RunMode::Simulation {
-                st.sim
-                    .as_mut()
-                    .unwrap()
-                    .drain_fills()
-                    .await
-                    .unwrap_or_default()
-            } else {
-                // Safety net: if the HL client was recreated, re-attach engine oids
-                // so website fills can still be matched.
-                let live = st
-                    .engine
-                    .as_ref()
-                    .map(|e| e.live_orders().to_vec())
-                    .unwrap_or_default();
-                if let Some(hl) = st.hl.as_mut() {
-                    hl.restore_tracked_orders(&live);
-                }
-                st.hl
-                    .as_mut()
-                    .unwrap()
-                    .drain_fills()
-                    .await
-                    .unwrap_or_default()
-            };
-
-            let mut replenish_intents = Vec::new();
-            let mut risk_exit_reason: Option<String> = None;
-            for fill in fills {
-                let side = format!("{:?}", fill.side);
-                match st.engine.as_mut().unwrap().on_fill(fill.clone()) {
-                    Ok((pnl, replenish)) => {
-                        let _ = st.storage.record_fill(
-                            &fill.symbol,
-                            &side,
-                            fill.price,
-                            fill.size,
-                            pnl,
-                            &fill.client_id,
-                        );
-                        let _ = app2.emit(
-                            "bot-event",
-                            &grid_engine::EngineEvent::Filled {
-                                fill: fill.clone(),
-                                realized_pnl: pnl,
-                            },
-                        );
-                        if let Some(intent) = replenish {
-                            replenish_intents.push(intent);
-                        }
-                    }
-                    Err(e) => {
-                        let reason = e.to_string();
-                        let _ = app2.emit(
-                            "bot-event",
-                            &grid_engine::EngineEvent::Halted {
-                                reason: reason.clone(),
-                            },
-                        );
-                        risk_exit_reason = Some(reason);
-                    }
-                }
-            }
-
-            if !replenish_intents.is_empty() && risk_exit_reason.is_none() {
-                let placed = if st.mode == RunMode::Simulation {
-                    st.sim
-                        .as_mut()
-                        .unwrap()
-                        .place_orders(replenish_intents)
-                        .await
-                } else {
-                    st.hl
-                        .as_mut()
-                        .unwrap()
-                        .place_orders(replenish_intents)
-                        .await
-                };
-                match placed {
-                    Ok(orders) => {
-                        for order in orders {
-                            st.engine
-                                .as_mut()
-                                .unwrap()
-                                .register_live_order(order.clone());
-                            let _ = app2.emit(
-                                "bot-event",
-                                &grid_engine::EngineEvent::OrderPlaced { order },
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ev) = st
-                            .engine
-                            .as_mut()
-                            .unwrap()
-                            .note_order_failure(&e.to_string())
-                        {
-                            if let grid_engine::EngineEvent::Halted { reason } = &ev {
-                                risk_exit_reason = Some(reason.clone());
-                            }
-                            let _ = app2.emit("bot-event", &ev);
-                        }
-                    }
-                }
-            }
-
-            if let Some(reason) = risk_exit_reason {
-                st.running_task = false;
-                match protect_symbol(&mut st, &symbol, true).await {
-                    Ok(()) => {
-                        if let Some(engine) = st.engine.as_mut() {
-                            engine.mark_risk_stopped(&reason);
-                        }
-                        let _ = st
-                            .storage
-                            .record_event("risk_protection", "orders canceled and position closed");
-                    }
-                    Err(exit_error) => {
-                        if let Some(engine) = st.engine.as_mut() {
-                            engine.mark_protective_exit_failed(&exit_error);
-                        }
-                        let _ = app2.emit(
-                            "bot-event",
-                            &grid_engine::EngineEvent::Halted {
-                                reason: format!(
-                                    "{reason}; automatic cancel/close also failed: {exit_error}"
-                                ),
-                            },
-                        );
-                    }
-                }
-                if let Some(engine) = st.engine.as_ref() {
-                    let _ = app2.emit("bot-status", &engine.snapshot());
-                }
-                break;
-            }
-
-            // Dashboard position must match the exchange, not only locally inferred fills.
-            if st.mode != RunMode::Simulation && st.running_task {
-                if let Some(hl) = st.hl.as_mut() {
-                    match hl.get_perp_position(&symbol).await {
-                        Ok((size, entry, upnl, liq)) => {
-                            if let Some(engine) = st.engine.as_mut() {
-                                engine.sync_position_from_exchange(size, entry, upnl, liq);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("position sync failed: {e}");
-                        }
-                    }
-                }
-            }
-
-            // Funding settles hourly; refresh once immediately, then about once per minute.
-            if st.mode != RunMode::Simulation && st.running_task && funding_poll_tick % 50 == 0 {
-                if let Some(hl) = st.hl.as_ref() {
-                    match hl.get_session_funding_pnl(&symbol).await {
-                        Ok(funding_pnl) => {
-                            if let Some(engine) = st.engine.as_mut() {
-                                engine.sync_funding_pnl(funding_pnl);
-                            }
-                        }
-                        Err(e) => warn!("funding pnl sync failed: {e}"),
-                    }
-                }
-            }
-            funding_poll_tick = funding_poll_tick.wrapping_add(1);
-
-            if let Some(engine) = st.engine.as_ref() {
-                let snap = engine.snapshot();
-                let _ = app2.emit("bot-status", &snap);
-            }
-        }
-        info!("bot loop exited");
+        run_loop(app2, state2).await;
     });
 
     let st = state_arc.lock().await;
-    Ok(st
+    return Ok(st
         .engine
         .as_ref()
         .map(|e| e.snapshot())
-        .unwrap_or_else(|| BotSnapshot {
-            status: grid_engine::BotStatus::Idle,
-            status_note: None,
-            mode: RunMode::Simulation,
-            symbol: req.symbol,
-            mid_price: None,
-            open_orders: 0,
-            fill_count: 0,
-            resting_orders: vec![],
-            position_base: Decimal::ZERO,
-            avg_entry_price: None,
-            liquidation_price: None,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
-            funding_pnl: Decimal::ZERO,
-            events_tail: vec![],
-        }))
+        .unwrap_or_else(|| idle_snapshot(RunMode::Simulation, req.symbol)));
 }
 
 #[tauri::command]
@@ -843,56 +696,6 @@ async fn ensure_exchange_ready(st: &mut AppState) -> Result<(), String> {
         .connect()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Cancel only this strategy symbol and optionally flatten only its position.
-async fn protect_symbol(
-    st: &mut AppState,
-    symbol: &str,
-    close_position: bool,
-) -> Result<(), String> {
-    if st.mode == RunMode::Simulation {
-        let sim = st.sim.as_mut().ok_or("simulation exchange unavailable")?;
-        sim.cancel_all(symbol).await.map_err(|e| e.to_string())?;
-        if !sim
-            .list_open_orders(symbol)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_empty()
-        {
-            return Err(format!("仍有 {symbol} 模拟挂单未撤销"));
-        }
-        if close_position {
-            sim.close_position(symbol)
-                .await
-                .map_err(|e| e.to_string())?;
-            if sim.position_size().await != Decimal::ZERO {
-                return Err(format!("仍有 {symbol} 模拟仓位未平"));
-            }
-        }
-        return Ok(());
-    }
-
-    let hl = st.hl.as_mut().ok_or("Hyperliquid exchange unavailable")?;
-    hl.cancel_all(symbol).await.map_err(|e| e.to_string())?;
-    if hl
-        .has_open_orders(symbol)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Err(format!("交易所仍有 {symbol} 挂单未撤销"));
-    }
-    if close_position {
-        hl.close_position(symbol).await.map_err(|e| e.to_string())?;
-        let (remaining, _, _, _) = hl
-            .get_perp_position(symbol)
-            .await
-            .map_err(|e| e.to_string())?;
-        if remaining != Decimal::ZERO {
-            return Err(format!("交易所仍有 {symbol} 仓位 {remaining}"));
-        }
-    }
     Ok(())
 }
 
@@ -959,11 +762,7 @@ async fn flatten_now(
     let reason = reason.unwrap_or_else(|| "manual".into());
     let mut st = state.lock().await;
     st.running_task = false;
-    let res = flatten_account_notify(&app, &mut st, &reason).await;
-    if reason == "exit" {
-        EXIT_FLATTEN_DONE.store(true, Ordering::SeqCst);
-    }
-    res
+    flatten_account_notify(&app, &mut st, &reason).await
 }
 
 #[tauri::command]
@@ -973,38 +772,58 @@ async fn stop_bot(
 ) -> Result<BotSnapshot, String> {
     let mut st = state.lock().await;
     st.running_task = false;
+    let symbol = st
+        .engine
+        .as_ref()
+        .map(|e| e.config.symbol.clone())
+        .unwrap_or_default();
     let snap = {
         if let Some(engine) = st.engine.as_mut() {
             let _ = engine.stop();
             engine.snapshot()
         } else {
-            BotSnapshot {
-                status: grid_engine::BotStatus::Idle,
-                status_note: None,
-                mode: st.mode,
-                symbol: String::new(),
-                mid_price: None,
-                open_orders: 0,
-                fill_count: 0,
-                resting_orders: vec![],
-                position_base: Decimal::ZERO,
-                avg_entry_price: None,
-                liquidation_price: None,
-                realized_pnl: Decimal::ZERO,
-                unrealized_pnl: Decimal::ZERO,
-                funding_pnl: Decimal::ZERO,
-                events_tail: vec![],
-            }
+            idle_snapshot(st.mode, symbol.clone())
         }
     };
-    // Always flatten on stop — cancel resting orders and close positions.
-    if let Err(e) = flatten_account_notify(&app, &mut st, "stop").await {
-        error!("flatten on stop failed: {e}");
-        return Err(format!("已停止策略，但平仓/撤单失败: {e}"));
+    if symbol.is_empty() {
+        return Ok(snap);
+    }
+    // Stop = cancel strategy symbol orders + close that symbol position only.
+    let _ = app.emit(
+        "flatten-start",
+        FlattenStartPayload {
+            reason: "stop".into(),
+        },
+    );
+    let res = protect_symbol(&mut st, &symbol, true).await;
+    let _ = app.emit(
+        "flatten-end",
+        FlattenEndPayload {
+            reason: "stop".into(),
+            ok: res.is_ok(),
+            error: res.as_ref().err().cloned(),
+        },
+    );
+    if let Err(e) = res {
+        error!("stop protect_symbol failed: {e}");
+        return Err(format!("已停止策略，但撤单/平仓失败: {e}"));
     }
     if let Some(engine) = st.engine.as_mut() {
-        engine.note("flattened: canceled orders & closed positions");
+        engine.note("stopped: canceled symbol orders & closed position");
+        let sid = engine.session_id().to_string();
+        let payload = engine.checkpoint_payload();
+        let cfg_json = serde_json::to_string(&engine.config).unwrap_or_else(|_| "{}".into());
+        // Session history uses `stopped` (clearer than engine Idle) for 中英文 UI.
+        let status = "stopped";
+        let _ = st.storage.save_checkpoint(&sid, "stopped", &payload);
+        let _ = st
+            .storage
+            .upsert_bot_session(&sid, "grid", &symbol, status, &cfg_json, false);
+        let _ = st.storage.deactivate_session(&sid, Some(status));
     }
+    let _ = st
+        .storage
+        .record_event("stop", "symbol orders canceled and position closed");
     Ok(st.engine.as_ref().map(|e| e.snapshot()).unwrap_or(snap))
 }
 
@@ -1023,6 +842,46 @@ async fn clear_logs(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Option<Bot
         return Ok(Some(engine.snapshot()));
     }
     Ok(None)
+}
+
+#[tauri::command]
+async fn clear_analytics(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    session_id: Option<String>,
+    all: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let st = state.lock().await;
+    let wipe_all = all.unwrap_or(false);
+    let sid = if wipe_all {
+        None
+    } else {
+        session_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| st.engine.as_ref().map(|e| e.session_id().to_string()))
+    };
+    if !wipe_all && sid.is_none() {
+        return Err("没有可清除的会话".into());
+    }
+    let cleared = st
+        .storage
+        .clear_analytics(sid.as_deref())
+        .map_err(|e| e.to_string())?;
+    let _ = st.storage.record_event(
+        "analytics_cleared",
+        &if wipe_all {
+            format!("cleared all analytics ({cleared} rows)")
+        } else {
+            format!(
+                "cleared analytics for session {} ({cleared} rows)",
+                sid.as_deref().unwrap_or("?")
+            )
+        },
+    );
+    Ok(serde_json::json!({
+        "cleared": cleared,
+        "session_id": sid,
+        "all": wipe_all,
+    }))
 }
 
 #[tauri::command]
@@ -1054,8 +913,127 @@ async fn export_fills_csv(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_session_pnl(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    session_id: Option<String>,
+    all: Option<bool>,
+) -> Result<Option<SessionPnlSummary>, String> {
+    let st = state.lock().await;
+    if all.unwrap_or(false) {
+        return st
+            .storage
+            .all_sessions_pnl_summary()
+            .map(Some)
+            .map_err(|e| e.to_string());
+    }
+    let sid = session_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| st.engine.as_ref().map(|e| e.session_id().to_string()));
+    let Some(sid) = sid else {
+        return Ok(None);
+    };
+    st.storage
+        .session_pnl_summary(&sid)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_sessions(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionListItem>, String> {
+    let st = state.lock().await;
+    st.storage
+        .list_session_summaries(limit.unwrap_or(50).clamp(1, 200))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_daily_pnl(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    session_id: Option<String>,
+    days: Option<u32>,
+) -> Result<Vec<DailyPnlRow>, String> {
+    let st = state.lock().await;
+    let sid = session_id.filter(|s| !s.is_empty());
+    st.storage
+        .daily_pnl(sid.as_deref(), days.unwrap_or(30))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_equity_curve(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    session_id: Option<String>,
+    days: Option<u32>,
+    all: Option<bool>,
+    limit: Option<usize>,
+) -> Result<Vec<EquitySnapshotRow>, String> {
+    let st = state.lock().await;
+    let lim = limit.unwrap_or(800).clamp(10, 5000);
+    if all.unwrap_or(false) {
+        let since = days.map(|d| {
+            let d = d.clamp(1, 365) as i64;
+            chrono::Utc::now().timestamp_millis() - d * 86_400_000
+        });
+        return st
+            .storage
+            .list_equity_curve_all(since, lim)
+            .map_err(|e| e.to_string());
+    }
+    let sid = session_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| st.engine.as_ref().map(|e| e.session_id().to_string()));
+    let Some(sid) = sid else {
+        return Ok(vec![]);
+    };
+    let since = days.map(|d| {
+        let d = d.clamp(1, 365) as i64;
+        chrono::Utc::now().timestamp_millis() - d * 86_400_000
+    });
+    st.storage
+        .list_equity_snapshots_range(&sid, since, lim, true)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn export_analytics_pack(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    session_id: Option<String>,
+    dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let st = state.lock().await;
+    let sid = session_id
+        .filter(|s| !s.is_empty())
+        .or_else(|| st.engine.as_ref().map(|e| e.session_id().to_string()));
+    let out_dir = if let Some(d) = dir.filter(|s| !s.is_empty()) {
+        PathBuf::from(d)
+    } else {
+        // `<program_dir>/data/analytics/...`
+        let base = resolve_data_dir().join("analytics");
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let name = match &sid {
+            Some(s) => format!("{}-{}", stamp, &s[..s.len().min(8)]),
+            None => format!("{stamp}-all"),
+        };
+        base.join(name)
+    };
+    let pack = st
+        .storage
+        .export_analytics_pack(&out_dir, sid.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "path": out_dir.to_string_lossy(),
+        "pack": pack,
+    }))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ExportConfig {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
     symbol: String,
     lower_price: String,
     upper_price: String,
@@ -1073,6 +1051,20 @@ struct ExportConfig {
     leverage: u32,
     #[serde(default = "default_cross_export")]
     is_cross: bool,
+    #[serde(default = "default_grid_mode_export")]
+    grid_mode: String,
+    #[serde(default)]
+    atr_interval: Option<String>,
+    #[serde(default)]
+    atr_period: Option<u32>,
+    #[serde(default)]
+    atr_mult: Option<String>,
+    #[serde(default)]
+    confirm_bars: Option<u32>,
+    #[serde(default)]
+    recenter_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    max_recenters_per_day: Option<u32>,
 }
 
 fn default_drawdown() -> String {
@@ -1090,9 +1082,16 @@ fn default_leverage_export() -> u32 {
 fn default_cross_export() -> bool {
     true
 }
+fn default_schema_version() -> u32 {
+    2
+}
+fn default_grid_mode_export() -> String {
+    "fixed".into()
+}
 
 #[tauri::command]
-fn export_strategy_config(cfg: ExportConfig) -> Result<String, String> {
+fn export_strategy_config(mut cfg: ExportConfig) -> Result<String, String> {
+    cfg.schema_version = 2;
     serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())
 }
 
@@ -1210,14 +1209,34 @@ pub fn run() {
         .manage(state)
         .setup(move |app| {
             let handle = app.handle().clone();
-            // On app launch: if wallet is configured, flatten leftover orders/positions.
+            let state_for_loop = state_for_startup.clone();
+            // Resume preserved session; never auto-flatten on launch.
             tauri::async_runtime::spawn(async move {
                 let mut st = state_for_startup.lock().await;
-                if st.mode != RunMode::Simulation && !st.private_key.trim().is_empty() {
-                    if let Err(e) = flatten_account_notify(&handle, &mut st, "startup").await {
-                        error!("flatten on startup failed: {e}");
-                    } else {
-                        info!("startup flatten completed");
+                match try_resume_active_session(&handle, &mut st).await {
+                    Ok(true) => {
+                        info!("resumed active session from checkpoint");
+                        let running = st.running_task;
+                        drop(st);
+                        if running {
+                            let app2 = handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                run_loop(app2, state_for_loop).await;
+                            });
+                        }
+                    }
+                    Ok(false) => {
+                        info!("no resumable session; waiting for user start");
+                    }
+                    Err(e) => {
+                        error!("session resume failed: {e}");
+                        let _ = handle.emit(
+                            "bot-alert",
+                            serde_json::json!({
+                                "kind": "resume_failed",
+                                "reason": e
+                            }),
+                        );
                     }
                 }
             });
@@ -1226,6 +1245,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             preview_grid_cmd,
+            estimate_dynamic_bounds,
             set_mode,
             set_private_key,
             get_account,
@@ -1243,7 +1263,13 @@ pub fn run() {
             list_fills,
             list_events,
             clear_logs,
+            clear_analytics,
             export_fills_csv,
+            get_session_pnl,
+            list_sessions,
+            get_daily_pnl,
+            list_equity_curve,
+            export_analytics_pack,
             export_strategy_config,
             import_strategy_config,
             get_language,
@@ -1255,10 +1281,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(move |_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                if EXIT_FLATTEN_DONE.swap(true, Ordering::SeqCst) {
-                    return;
-                }
-                // Fallback when close path did not flatten (e.g. forced kill after UI).
+                // Preserve exchange orders & position; only persist checkpoint.
                 let state = state_for_exit.clone();
                 let _ = std::thread::spawn(move || {
                     if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -1267,12 +1290,8 @@ pub fn run() {
                     {
                         rt.block_on(async move {
                             let mut st = state.lock().await;
-                            st.running_task = false;
-                            if let Err(e) = flatten_account(&mut st).await {
-                                error!("flatten on exit failed: {e}");
-                            } else {
-                                info!("exit flatten completed");
-                            }
+                            detach_on_exit(&mut st);
+                            info!("exit: session detached (orders/position preserved)");
                         });
                     }
                 })

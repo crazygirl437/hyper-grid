@@ -6,6 +6,7 @@ use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
+// chrono used for simulated fill timestamps
 
 use crate::traits::{Balance, Exchange, ExchangeResult};
 
@@ -194,9 +195,23 @@ impl SimExchange {
                 size: order.size,
                 level_index: order.level_index,
                 fee: Decimal::ZERO,
+                fee_token: Some("USDC".into()),
+                exchange_tid: Some(format!("sim-tid-{id}")),
+                exchange_oid: order.exchange_id.clone(),
+                cloid: order.cloid.clone(),
+                exchange_time_ms: Some(chrono::Utc::now().timestamp_millis()),
+                crossed: false,
+                dir: None,
+                closed_pnl: None,
             });
             orders.remove(&id);
         }
+    }
+
+    /// Force mid outside band for breakout/recenter tests.
+    pub async fn force_mid(&self, mid: Decimal) {
+        let mut st = self.state.lock().await;
+        st.mid = mid;
     }
 }
 
@@ -248,20 +263,54 @@ impl Exchange for SimExchange {
     }
 
     async fn place_order(&mut self, intent: OrderIntent) -> ExchangeResult<LiveOrder> {
-        let order = LiveOrder::new(
-            intent.client_id.clone(),
-            Some(format!("sim-{}", intent.client_id)),
-            intent.symbol,
-            intent.side,
-            intent.price,
-            intent.size,
-            intent.level_index,
-        );
+        // Mirror Hyperliquid: reduce-only must shrink position and not flip through flat.
+        if intent.reduce_only {
+            let pos = *self.base_balance.lock().await;
+            let ok = match intent.side {
+                Side::Buy => pos < Decimal::ZERO && intent.size <= pos.abs(),
+                Side::Sell => pos > Decimal::ZERO && intent.size <= pos.abs(),
+            };
+            if !ok {
+                return Err(crate::ExchangeError::Other(
+                    "Reduce only order would increase position".into(),
+                ));
+            }
+        }
+        let mut order = LiveOrder::from_intent(&intent, Some(format!("sim-{}", intent.client_id)));
+        order.symbol = intent.symbol;
         self.orders
             .lock()
             .await
             .insert(order.client_id.clone(), order.clone());
         Ok(order)
+    }
+
+    async fn get_position(&self, symbol: &str) -> ExchangeResult<crate::traits::PositionSnapshot> {
+        let size = if symbol == self.symbol {
+            *self.base_balance.lock().await
+        } else {
+            Decimal::ZERO
+        };
+        Ok(crate::traits::PositionSnapshot {
+            symbol: symbol.to_string(),
+            size,
+            entry_price: None,
+            unrealized_pnl: Some(Decimal::ZERO),
+            liquidation_price: None,
+        })
+    }
+
+    async fn cancel_all_confirmed(
+        &mut self,
+        symbol: &str,
+        _max_attempts: u32,
+    ) -> ExchangeResult<crate::traits::CancelReport> {
+        self.cancel_all(symbol).await?;
+        Ok(crate::traits::CancelReport {
+            canceled: 0,
+            remaining_oids: vec![],
+            confirmed_flat: true,
+        })
     }
 
     async fn cancel_order(&mut self, client_id: &str) -> ExchangeResult<()> {
@@ -334,6 +383,83 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cancel_confirmed_preserves_position() {
+        let mut sim = SimExchange::new("BTC", dec!(100), dec!(1000), dec!(2));
+        sim.place_order(OrderIntent {
+            client_id: "o1".into(),
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            price: dec!(90),
+            size: dec!(1),
+            level_index: 0,
+            reduce_only: false,
+            tif: grid_engine::TimeInForce::Gtc,
+            cloid: None,
+        })
+        .await
+        .unwrap();
+        let report = sim.cancel_all_confirmed("BTC", 3).await.unwrap();
+        assert!(report.confirmed_flat);
+        assert!(sim.list_open_orders("BTC").await.unwrap().is_empty());
+        assert_eq!(sim.position_size().await, dec!(2));
+    }
+
+    #[tokio::test]
+    async fn reduce_only_rejects_expanding_order() {
+        // Long 2 — a reduce-only buy would expand, so it must fail.
+        let mut sim = SimExchange::new("BTC", dec!(100), dec!(1000), dec!(2));
+        let err = sim
+            .place_order(OrderIntent {
+                client_id: "ro".into(),
+                symbol: "BTC".into(),
+                side: Side::Buy,
+                price: dec!(90),
+                size: dec!(1),
+                level_index: 0,
+                reduce_only: true,
+                tif: grid_engine::TimeInForce::Gtc,
+                cloid: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_ascii_lowercase().contains("reduce"));
+    }
+
+    #[tokio::test]
+    async fn force_mid_allows_offline_fill_without_replenish_helper() {
+        let mut sim = SimExchange::with_band(
+            "BTC",
+            dec!(100),
+            dec!(1000),
+            dec!(0),
+            dec!(90),
+            dec!(110),
+        );
+        sim.connect().await.unwrap();
+        sim.place_order(OrderIntent {
+            client_id: "buy1".into(),
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            price: dec!(99),
+            size: dec!(1),
+            level_index: 0,
+            reduce_only: false,
+            tif: grid_engine::TimeInForce::Gtc,
+            cloid: None,
+        })
+        .await
+        .unwrap();
+        // Drift mid down to fill the bid without canceling (app-closed scenario).
+        sim.force_mid(dec!(98)).await;
+        for _ in 0..20 {
+            let _ = sim.get_mid("BTC").await;
+        }
+        let fills = sim.drain_fills().await.unwrap();
+        assert!(!fills.is_empty() || sim.position_size().await != Decimal::ZERO
+            || !sim.list_open_orders("BTC").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn symbol_protection_cancels_only_target_and_closes_position() {
         let mut sim = SimExchange::new("BTC", dec!(100), dec!(1000), dec!(2));
         sim.place_order(OrderIntent {
@@ -343,6 +469,9 @@ mod tests {
             price: dec!(90),
             size: dec!(1),
             level_index: 0,
+            reduce_only: false,
+            tif: grid_engine::TimeInForce::Gtc,
+            cloid: Some("btcorder000000000000000000000001".into()),
         })
         .await
         .unwrap();
@@ -353,6 +482,9 @@ mod tests {
             price: dec!(110),
             size: dec!(1),
             level_index: 1,
+            reduce_only: false,
+            tif: grid_engine::TimeInForce::Gtc,
+            cloid: Some("ethorder000000000000000000000001".into()),
         })
         .await
         .unwrap();

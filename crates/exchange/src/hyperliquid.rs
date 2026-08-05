@@ -27,6 +27,8 @@ pub struct HyperliquidExchange {
     /// label/alias -> allMids key (e.g. HFUN/USDC -> @1)
     mid_aliases: HashMap<String, String>,
     last_seen_fills: Vec<String>,
+    /// Fills from orders that matched immediately on place (never rested).
+    pending_immediate_fills: Vec<FillEvent>,
     /// After priming, historical exchange fills are ignored.
     fills_primed: bool,
     /// Only emit fills at/after this exchange timestamp (ms).
@@ -56,6 +58,7 @@ impl HyperliquidExchange {
             sz_decimals: HashMap::new(),
             mid_aliases: HashMap::new(),
             last_seen_fills: Vec::new(),
+            pending_immediate_fills: Vec::new(),
             fills_primed: false,
             session_start_ms: 0,
         }
@@ -98,29 +101,49 @@ impl HyperliquidExchange {
 
     /// Account equity available for sizing max position (USDC).
     pub async fn account_equity_usdc(&self) -> ExchangeResult<Decimal> {
+        self.account_equity_usdc_for(None).await
+    }
+
+    /// Equity / free collateral for a market. HIP-3 symbols query that DEX clearinghouse.
+    pub async fn account_equity_usdc_for(
+        &self,
+        symbol: Option<&str>,
+    ) -> ExchangeResult<Decimal> {
         let mut equity = Decimal::ZERO;
+        let mut free = Decimal::ZERO;
         if let Some(addr) = &self.address {
-            if let Ok(state) = self
-                .post_info(json!({"type": "clearinghouseState", "user": addr}))
+            let key = symbol.map(|s| self.resolve_mid_key(s));
+            let dex = key.as_deref().and_then(Self::dex_from_symbol);
+            let state = if let Some(dex) = dex {
+                self.post_info(json!({
+                    "type": "clearinghouseState",
+                    "user": addr,
+                    "dex": dex
+                }))
                 .await
-            {
-                for key in ["crossMarginSummary", "marginSummary"] {
-                    if let Some(v) = state
-                        .get(key)
-                        .and_then(|m| m.get("accountValue"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| Decimal::from_str(s).ok())
-                    {
-                        equity = equity.max(v);
-                    }
-                }
-                if let Some(w) = state
-                    .get("withdrawable")
+                .unwrap_or(json!({}))
+            } else {
+                self.post_info(json!({"type": "clearinghouseState", "user": addr}))
+                    .await
+                    .unwrap_or(json!({}))
+            };
+            for key in ["crossMarginSummary", "marginSummary"] {
+                if let Some(v) = state
+                    .get(key)
+                    .and_then(|m| m.get("accountValue"))
                     .and_then(|v| v.as_str())
                     .and_then(|s| Decimal::from_str(s).ok())
                 {
-                    equity = equity.max(w);
+                    equity = equity.max(v);
                 }
+            }
+            if let Some(w) = state
+                .get("withdrawable")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Decimal::from_str(s).ok())
+            {
+                free = free.max(w);
+                equity = equity.max(w);
             }
         }
         // Unified accounts often keep equity in spot USDC.
@@ -128,18 +151,32 @@ impl HyperliquidExchange {
             for b in bals {
                 if b.asset.eq_ignore_ascii_case("USDC") {
                     equity = equity.max(b.available).max(b.total);
+                    free = free.max(b.available);
                 }
             }
         }
-        Ok(equity)
+        // Prefer free/withdrawable when present — accountValue can include locked margin.
+        if free > Decimal::ZERO {
+            Ok(free)
+        } else {
+            Ok(equity)
+        }
     }
 
     /// Rough max one-sided position notional at `leverage` (with a small safety buffer).
     pub async fn max_side_notional(&self, leverage: u32) -> ExchangeResult<Decimal> {
-        let equity = self.account_equity_usdc().await?;
+        self.max_side_notional_for(None, leverage).await
+    }
+
+    pub async fn max_side_notional_for(
+        &self,
+        symbol: Option<&str>,
+        leverage: u32,
+    ) -> ExchangeResult<Decimal> {
+        let equity = self.account_equity_usdc_for(symbol).await?;
         let lev = Decimal::from(leverage.max(1));
-        // 90% buffer for fees / mark movement / open-order haircut.
-        Ok((equity * lev * dec!(0.90)).round_dp(2))
+        // Conservative buffer: open-order haircut, fees, mark drift, isolated reservation.
+        Ok((equity * lev * dec!(0.75)).round_dp(2))
     }
 
     /// Reject grid intents early if either side would exceed leverage position cap.
@@ -157,8 +194,9 @@ impl HyperliquidExchange {
                 Side::Sell => sell_ntl += n,
             }
         }
-        let max_side = self.max_side_notional(leverage).await?;
-        let equity = self.account_equity_usdc().await?;
+        let symbol = intents.first().map(|i| i.symbol.as_str());
+        let max_side = self.max_side_notional_for(symbol, leverage).await?;
+        let equity = self.account_equity_usdc_for(symbol).await?;
         let worst = buy_ntl.max(sell_ntl);
         if max_side <= Decimal::ZERO {
             return Err(ExchangeError::Other(format!(
@@ -170,7 +208,8 @@ impl HyperliquidExchange {
             let suggest_total = (max_side * dec!(2) * dec!(0.95)).round_dp(0);
             return Err(ExchangeError::Other(format!(
                 "网格单边名义约 {worst} USDC，超过当前 {leverage}x 杠杆允许的约 {max_side} USDC \
-（保证金约 {equity} USDC）。请把「总名义投入」降到约 {suggest_total} 以下，或降低杠杆 / 增加保证金。"
+（可用保证金约 {equity} USDC）。请把「总名义投入」降到约 {suggest_total} 以下，\
+或减少网格数量 / 提高杠杆 / 增加保证金；若该币种已有仓位也会占用保证金。"
             )));
         }
         Ok(())
@@ -257,6 +296,28 @@ impl HyperliquidExchange {
         ))
     }
 
+    /// Replace local open-order cache for `symbol` with exchange truth (keep ids from `orders`).
+    pub fn adopt_open_orders(&mut self, symbol: &str, orders: &[LiveOrder]) {
+        let key = self.resolve_mid_key(symbol);
+        let keyed: Vec<(String, String)> = self
+            .open_orders
+            .iter()
+            .map(|(id, o)| (id.clone(), o.symbol.clone()))
+            .collect();
+        for (id, sym) in keyed {
+            let ok = self.resolve_mid_key(&sym);
+            if ok.eq_ignore_ascii_case(&key)
+                || sym.eq_ignore_ascii_case(symbol)
+                || ok.eq_ignore_ascii_case(symbol)
+            {
+                self.open_orders.remove(&id);
+            }
+        }
+        for o in orders {
+            self.open_orders.insert(o.client_id.clone(), o.clone());
+        }
+    }
+
     /// Query exchange state directly instead of trusting the local oid map.
     pub async fn has_open_orders(&self, symbol: &str) -> ExchangeResult<bool> {
         let addr = self.address.as_ref().ok_or(ExchangeError::NotConnected)?;
@@ -339,9 +400,17 @@ impl HyperliquidExchange {
     }
 
     async fn refresh_spot_meta(&mut self) -> ExchangeResult<()> {
+        // Keep prior HIP-3 mappings when a partial refresh fails (common under 429).
+        // Otherwise `get_account` → `connect()` can wipe `xyz:CXMT` mid-session and
+        // break place/cancel with "unknown symbol".
+        let previous_assets = self.asset_index.clone();
+        let previous_aliases = self.mid_aliases.clone();
+        let previous_sz = self.sz_decimals.clone();
+
         let mut map = HashMap::new();
         let mut aliases = HashMap::new();
         let mut sz_decimals = HashMap::new();
+        let mut loaded_hip3_dexes: Vec<String> = Vec::new();
 
         // Perp names first so bare symbols like BTC keep the perpetual asset / mid,
         // instead of being stolen by a spot token also named BTC (common on testnet).
@@ -359,95 +428,204 @@ impl HyperliquidExchange {
         }
 
         // HIP-3: only load xyz (equity perps like SNDK/SKHY) to avoid rate limits.
-        if let Ok(dexs) = self.post_info(json!({"type": "perpDexs"})).await {
-            if let Some(arr) = dexs.as_array() {
-                for (dex_index, item) in arr.iter().enumerate() {
-                    let Some(dex_name) = item.get("name").and_then(|n| n.as_str()) else {
-                        continue; // index 0 is null = native perps
-                    };
-                    if dex_name != "xyz" {
-                        continue;
-                    }
-                    let Ok(meta) = self
-                        .post_info(json!({"type": "meta", "dex": dex_name}))
-                        .await
-                    else {
-                        continue;
-                    };
-                    let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) else {
-                        continue;
-                    };
-                    for (i, asset) in universe.iter().enumerate() {
-                        if asset.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
-                            continue;
-                        }
-                        let Some(name) = asset.get("name").and_then(|n| n.as_str()) else {
-                            continue;
-                        };
-                        let asset_id = 100_000u32 + (dex_index as u32) * 10_000 + i as u32;
-                        let decs = asset
-                            .get("szDecimals")
-                            .and_then(|d| d.as_u64())
-                            .unwrap_or(4) as u32;
-                        map.insert(name.to_string(), asset_id);
-                        sz_decimals.insert(name.to_string(), decs);
-                        if let Some((_, coin)) = name.split_once(':') {
-                            if !map.contains_key(coin) {
-                                aliases.insert(coin.to_string(), name.to_string());
-                                map.insert(coin.to_string(), asset_id);
-                                sz_decimals.insert(coin.to_string(), decs);
-                            }
-                        }
-                    }
-                }
-            }
+        match self.merge_hip3_dex_meta("xyz", &mut map, &mut aliases, &mut sz_decimals).await {
+            Ok(true) => loaded_hip3_dexes.push("xyz".into()),
+            Ok(false) => warn!("HIP-3 xyz meta empty; preserving prior xyz asset index if any"),
+            Err(e) => warn!("HIP-3 xyz meta refresh failed ({e}); preserving prior xyz asset index"),
         }
 
-        let meta = self.post_info(json!({"type": "spotMeta"})).await?;
-        let tokens: HashMap<u64, String> = meta
-            .get("tokens")
-            .and_then(|t| t.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|tok| {
-                        let idx = tok.get("index")?.as_u64()?;
-                        let name = tok.get("name")?.as_str()?.to_string();
-                        Some((idx, name))
+        // spotMeta is best-effort: failure must not wipe a healthy perp/HIP-3 index.
+        match self.post_info(json!({"type": "spotMeta"})).await {
+            Ok(meta) => {
+                let tokens: HashMap<u64, String> = meta
+                    .get("tokens")
+                    .and_then(|t| t.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|tok| {
+                                let idx = tok.get("index")?.as_u64()?;
+                                let name = tok.get("name")?.as_str()?.to_string();
+                                Some((idx, name))
+                            })
+                            .collect()
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .unwrap_or_default();
 
-        if let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) {
-            for (i, item) in universe.iter().enumerate() {
-                if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                    let spot_id = 10_000u32 + i as u32;
-                    map.insert(name.to_string(), spot_id);
-                    if let Some(arr) = item.get("tokens").and_then(|t| t.as_array()) {
-                        if let (Some(b), Some(q)) = (
-                            arr.first().and_then(|x| x.as_u64()),
-                            arr.get(1).and_then(|x| x.as_u64()),
-                        ) {
-                            let base = tokens.get(&b).cloned().unwrap_or_else(|| format!("T{b}"));
-                            let quote = tokens.get(&q).cloned().unwrap_or_else(|| "USDC".into());
-                            let label = format!("{base}/{quote}");
-                            aliases.insert(label.clone(), name.to_string());
-                            map.insert(label, spot_id);
-                            // Only alias bare base (e.g. BTC -> @50) when it does not
-                            // collide with an existing perp coin name.
-                            if !map.contains_key(&base) {
-                                aliases.insert(base.clone(), name.to_string());
-                                map.insert(base, spot_id);
+                if let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) {
+                    for (i, item) in universe.iter().enumerate() {
+                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                            let spot_id = 10_000u32 + i as u32;
+                            map.insert(name.to_string(), spot_id);
+                            if let Some(arr) = item.get("tokens").and_then(|t| t.as_array()) {
+                                if let (Some(b), Some(q)) = (
+                                    arr.first().and_then(|x| x.as_u64()),
+                                    arr.get(1).and_then(|x| x.as_u64()),
+                                ) {
+                                    let base =
+                                        tokens.get(&b).cloned().unwrap_or_else(|| format!("T{b}"));
+                                    let quote =
+                                        tokens.get(&q).cloned().unwrap_or_else(|| "USDC".into());
+                                    let label = format!("{base}/{quote}");
+                                    aliases.insert(label.clone(), name.to_string());
+                                    map.insert(label, spot_id);
+                                    // Only alias bare base (e.g. BTC -> @50) when it does not
+                                    // collide with an existing perp coin name.
+                                    if !map.contains_key(&base) {
+                                        aliases.insert(base.clone(), name.to_string());
+                                        map.insert(base, spot_id);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+            Err(e) => warn!("spotMeta refresh failed ({e}); continuing with perp/HIP-3 index"),
         }
+
+        // Restore HIP-3 coins for dexes we failed to reload this pass.
+        for (k, v) in &previous_assets {
+            let Some((dex, _)) = k.split_once(':') else {
+                continue;
+            };
+            if loaded_hip3_dexes.iter().any(|d| d == dex) {
+                continue;
+            }
+            map.entry(k.clone()).or_insert(*v);
+            if let Some(dec) = previous_sz.get(k) {
+                sz_decimals.entry(k.clone()).or_insert(*dec);
+            }
+        }
+        for (alias, canon) in &previous_aliases {
+            let Some((dex, _)) = canon.split_once(':') else {
+                continue;
+            };
+            if loaded_hip3_dexes.iter().any(|d| d == dex) {
+                continue;
+            }
+            aliases
+                .entry(alias.clone())
+                .or_insert_with(|| canon.clone());
+            if let Some(id) = previous_assets.get(alias).or_else(|| previous_assets.get(canon)) {
+                map.entry(alias.clone()).or_insert(*id);
+            }
+            if let Some(dec) = previous_sz
+                .get(alias)
+                .or_else(|| previous_sz.get(canon))
+            {
+                sz_decimals.entry(alias.clone()).or_insert(*dec);
+            }
+        }
+
+        if map.is_empty() && !previous_assets.is_empty() {
+            warn!("meta refresh produced empty index; keeping previous asset_index");
+            return Ok(());
+        }
+
         self.asset_index = map;
         self.mid_aliases = aliases;
         self.sz_decimals = sz_decimals;
         Ok(())
+    }
+
+    /// Merge one HIP-3 dex universe into the given maps.
+    /// Returns Ok(true) when at least one asset was loaded.
+    async fn merge_hip3_dex_meta(
+        &self,
+        dex_name: &str,
+        map: &mut HashMap<String, u32>,
+        aliases: &mut HashMap<String, String>,
+        sz_decimals: &mut HashMap<String, u32>,
+    ) -> ExchangeResult<bool> {
+        let dexs = self.post_info(json!({"type": "perpDexs"})).await?;
+        let Some(arr) = dexs.as_array() else {
+            return Ok(false);
+        };
+        let mut loaded = false;
+        for (dex_index, item) in arr.iter().enumerate() {
+            let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+                continue; // index 0 is null = native perps
+            };
+            if name != dex_name {
+                continue;
+            }
+            let meta = self
+                .post_info(json!({"type": "meta", "dex": dex_name}))
+                .await?;
+            let Some(universe) = meta.get("universe").and_then(|u| u.as_array()) else {
+                return Ok(false);
+            };
+            for (i, asset) in universe.iter().enumerate() {
+                if asset.get("isDelisted").and_then(|d| d.as_bool()) == Some(true) {
+                    continue;
+                }
+                let Some(coin_name) = asset.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let asset_id = 100_000u32 + (dex_index as u32) * 10_000 + i as u32;
+                let decs = asset
+                    .get("szDecimals")
+                    .and_then(|d| d.as_u64())
+                    .unwrap_or(4) as u32;
+                map.insert(coin_name.to_string(), asset_id);
+                sz_decimals.insert(coin_name.to_string(), decs);
+                loaded = true;
+                if let Some((_, coin)) = coin_name.split_once(':') {
+                    if !map.contains_key(coin) {
+                        aliases.insert(coin.to_string(), coin_name.to_string());
+                        map.insert(coin.to_string(), asset_id);
+                        sz_decimals.insert(coin.to_string(), decs);
+                    }
+                }
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Resolve asset id, refreshing HIP-3/native meta once if missing.
+    async fn ensure_asset(&mut self, symbol: &str) -> ExchangeResult<u32> {
+        if let Ok(a) = self.resolve_asset(symbol) {
+            return Ok(a);
+        }
+        if let Some(dex) = Self::dex_from_symbol(symbol) {
+            let mut map = self.asset_index.clone();
+            let mut aliases = self.mid_aliases.clone();
+            let mut sz = self.sz_decimals.clone();
+            match self
+                .merge_hip3_dex_meta(dex, &mut map, &mut aliases, &mut sz)
+                .await
+            {
+                Ok(true) => {
+                    self.asset_index = map;
+                    self.mid_aliases = aliases;
+                    self.sz_decimals = sz;
+                }
+                Ok(false) => {
+                    warn!("ensure_asset: {dex} meta empty for {symbol}");
+                }
+                Err(e) => {
+                    warn!("ensure_asset: {dex} meta refresh failed for {symbol}: {e}");
+                    // Fall through to full refresh.
+                    self.refresh_spot_meta().await?;
+                }
+            }
+        } else {
+            self.refresh_spot_meta().await?;
+        }
+        self.resolve_asset(symbol)
+    }
+
+    pub fn has_meta(&self) -> bool {
+        !self.asset_index.is_empty()
+    }
+
+    /// Connect only when meta has never been loaded (safe for UI balance polls).
+    pub async fn ensure_connected(&mut self) -> ExchangeResult<()> {
+        if self.has_meta() {
+            Ok(())
+        } else {
+            self.connect().await
+        }
     }
 
     /// Builder DEX name from HIP-3 symbol (`xyz:SNDK` -> `xyz`).
@@ -564,12 +742,12 @@ impl HyperliquidExchange {
 
     /// Set leverage for a perpetual coin before trading.
     pub async fn set_leverage(
-        &self,
+        &mut self,
         symbol: &str,
         leverage: u32,
         is_cross: bool,
     ) -> ExchangeResult<()> {
-        let asset = self.resolve_asset(symbol)?;
+        let asset = self.ensure_asset(symbol).await?;
         let action = json!({
             "type": "updateLeverage",
             "asset": asset,
@@ -799,6 +977,12 @@ fn summarize_batch_place_errors(placed: usize, errors: &[String]) -> String {
 原因：买单或卖单一侧的合计名义过大。请降低「总名义投入」、降低杠杆，或先充值增加保证金后重试。"
         );
     }
+    if joined.to_ascii_lowercase().contains("insufficient margin") {
+        return format!(
+            "保证金不足，无法挂完全部网格单（已撤销本次成功的 {placed} 笔）。\
+请降低「总名义投入」或网格数量、改为全仓/提高可用保证金，并确认该币种没有残留仓位占用保证金后重试。"
+        );
+    }
     // Deduplicate noisy repeated API lines.
     let mut uniq = Vec::new();
     for e in errors {
@@ -815,16 +999,28 @@ fn summarize_batch_place_errors(placed: usize, errors: &[String]) -> String {
     )
 }
 
-fn parse_order_status_item(status: &Value) -> ExchangeResult<u64> {
+#[derive(Debug, Clone)]
+struct PlacedOrderAck {
+    oid: u64,
+    /// HL returned `filled` (crossed book) rather than `resting`.
+    immediately_filled: bool,
+}
+
+fn parse_order_status_item(status: &Value) -> ExchangeResult<PlacedOrderAck> {
     if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
         return Err(ExchangeError::Api(err.to_string()));
     }
-    if let Some(oid) = status
-        .pointer("/resting/oid")
-        .and_then(|o| o.as_u64())
-        .or_else(|| status.pointer("/filled/oid").and_then(|o| o.as_u64()))
-    {
-        return Ok(oid);
+    if let Some(oid) = status.pointer("/resting/oid").and_then(|o| o.as_u64()) {
+        return Ok(PlacedOrderAck {
+            oid,
+            immediately_filled: false,
+        });
+    }
+    if let Some(oid) = status.pointer("/filled/oid").and_then(|o| o.as_u64()) {
+        return Ok(PlacedOrderAck {
+            oid,
+            immediately_filled: true,
+        });
     }
     Err(ExchangeError::Api(format!(
         "order not resting on book: {status}"
@@ -841,13 +1037,13 @@ fn parse_order_oid(resp: &Value) -> ExchangeResult<u64> {
     let status = statuses
         .first()
         .ok_or_else(|| ExchangeError::Api("empty order statuses".into()))?;
-    parse_order_status_item(status)
+    Ok(parse_order_status_item(status)?.oid)
 }
 
 fn parse_batch_order_oids(
     resp: &Value,
     expected: usize,
-) -> ExchangeResult<Vec<ExchangeResult<u64>>> {
+) -> ExchangeResult<Vec<ExchangeResult<PlacedOrderAck>>> {
     let statuses = resp
         .pointer("/response/data/statuses")
         .and_then(|s| s.as_array())
@@ -1059,7 +1255,7 @@ impl Exchange for HyperliquidExchange {
             let mut wires = Vec::with_capacity(chunk.len());
             let mut prepared = Vec::with_capacity(chunk.len());
             for intent in chunk {
-                let asset = self.resolve_asset(&intent.symbol)?;
+                let asset = self.ensure_asset(&intent.symbol).await?;
                 let is_buy = matches!(intent.side, Side::Buy);
                 let sz_dec = *self.sz_decimals.get(&intent.symbol).unwrap_or(&4);
                 let px = round_perp_price(intent.price, sz_dec);
@@ -1070,14 +1266,29 @@ impl Exchange for HyperliquidExchange {
                         "订单名义约 {notional} USDC，低于 Hyperliquid 最低 $10。请提高总投入或减少网格数量。"
                     )));
                 }
-                wires.push(json!({
+                let tif = match intent.tif {
+                    grid_engine::TimeInForce::Gtc => "Gtc",
+                    grid_engine::TimeInForce::Ioc => "Ioc",
+                    grid_engine::TimeInForce::Alo => "Alo",
+                };
+                let mut wire = json!({
                     "a": asset,
                     "b": is_buy,
                     "p": float_to_wire(px),
                     "s": float_to_wire(sz),
-                    "r": false,
-                    "t": {"limit": {"tif": "Gtc"}}
-                }));
+                    "r": intent.reduce_only,
+                    "t": {"limit": {"tif": tif}}
+                });
+                if let Some(cloid) = intent.cloid.as_ref().filter(|c| !c.is_empty()) {
+                    // Hyperliquid cloid is 16-byte hex; use first 32 hex chars of uuid-without-dashes.
+                    let mut hex: String = cloid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+                    while hex.len() < 32 {
+                        hex.push('0');
+                    }
+                    let cloid16 = &hex[..32];
+                    wire["c"] = json!(format!("0x{cloid16}"));
+                }
+                wires.push(wire);
                 prepared.push((intent, px, sz));
             }
             let action = json!({
@@ -1096,16 +1307,41 @@ impl Exchange for HyperliquidExchange {
             let mut errors = Vec::new();
             for ((intent, px, sz), result) in prepared.into_iter().zip(results) {
                 match result {
-                    Ok(oid) => {
-                        let order = LiveOrder::new(
-                            intent.client_id.clone(),
-                            Some(oid.to_string()),
-                            intent.symbol.clone(),
-                            intent.side,
-                            px,
-                            sz,
-                            intent.level_index,
+                    Ok(ack) if ack.immediately_filled => {
+                        // Already matched — emit as a fill so the engine can replenish.
+                        warn!(
+                            "order immediately filled (not resting) oid={} {} {} @ {}",
+                            ack.oid, intent.symbol, sz, px
                         );
+                        self.pending_immediate_fills.push(FillEvent {
+                            client_id: intent.client_id.clone(),
+                            symbol: intent.symbol.clone(),
+                            side: intent.side,
+                            price: px,
+                            size: sz,
+                            level_index: intent.level_index,
+                            fee: Decimal::ZERO,
+                            fee_token: None,
+                            exchange_tid: None,
+                            exchange_oid: Some(ack.oid.to_string()),
+                            cloid: intent.cloid.clone(),
+                            exchange_time_ms: Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0),
+                            ),
+                            crossed: true,
+                            dir: None,
+                            closed_pnl: None,
+                        });
+                    }
+                    Ok(ack) => {
+                        let mut order =
+                            LiveOrder::from_intent(intent, Some(ack.oid.to_string()));
+                        order.price = px;
+                        order.size = sz;
+                        order.orig_size = sz;
                         self.open_orders
                             .insert(order.client_id.clone(), order.clone());
                         placed.push(order);
@@ -1133,7 +1369,7 @@ impl Exchange for HyperliquidExchange {
                 let oid = oid_str.parse::<u64>().map_err(|_| {
                     ExchangeError::Other(format!("invalid exchange order id {oid_str}"))
                 })?;
-                let asset = self.resolve_asset(&order.symbol)?;
+                let asset = self.ensure_asset(&order.symbol).await?;
                 let action = json!({
                     "type": "cancel",
                     "cancels": [{"a": asset, "o": oid}]
@@ -1160,6 +1396,10 @@ impl Exchange for HyperliquidExchange {
                 return Ok(());
             }
         };
+        if !symbol.is_empty() {
+            // Recover HIP-3 asset ids wiped by a partial meta refresh.
+            let _ = self.ensure_asset(symbol).await;
+        }
         let key = if symbol.is_empty() {
             String::new()
         } else {
@@ -1175,6 +1415,7 @@ impl Exchange for HyperliquidExchange {
                 .unwrap_or(json!([]))
         };
         let mut cancels = Vec::new();
+        let mut unresolved = 0u32;
         if let Some(arr) = open.as_array() {
             for o in arr {
                 let coin = o.get("coin").and_then(|c| c.as_str()).unwrap_or("");
@@ -1187,26 +1428,47 @@ impl Exchange for HyperliquidExchange {
                 };
                 let asset = match self.resolve_asset(coin) {
                     Ok(a) => a,
-                    Err(_) => continue,
+                    Err(_) => match self.ensure_asset(coin).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            warn!("cancel_all: cannot resolve {coin}: {e}");
+                            unresolved += 1;
+                            continue;
+                        }
+                    },
                 };
                 cancels.push(json!({"a": asset, "o": oid}));
             }
         }
         // Also include any locally tracked oids not returned yet.
-        for order in self.open_orders.values() {
+        let local_orders: Vec<_> = self.open_orders.values().cloned().collect();
+        for order in local_orders {
             if !key.is_empty() && order.symbol != symbol && order.symbol != key {
                 continue;
             }
             if let Some(oid_str) = &order.exchange_id {
                 if let Ok(oid) = oid_str.parse::<u64>() {
-                    if let Ok(asset) = self.resolve_asset(&order.symbol) {
-                        let item = json!({"a": asset, "o": oid});
-                        if !cancels.iter().any(|c| c == &item) {
-                            cancels.push(item);
-                        }
+                    let asset = match self.resolve_asset(&order.symbol) {
+                        Ok(a) => a,
+                        Err(_) => match self.ensure_asset(&order.symbol).await {
+                            Ok(a) => a,
+                            Err(_) => {
+                                unresolved += 1;
+                                continue;
+                            }
+                        },
+                    };
+                    let item = json!({"a": asset, "o": oid});
+                    if !cancels.iter().any(|c| c == &item) {
+                        cancels.push(item);
                     }
                 }
             }
+        }
+        if cancels.is_empty() && unresolved > 0 {
+            return Err(ExchangeError::Other(format!(
+                "cancel_all: {unresolved} open order(s) for {symbol} could not resolve asset id (unknown symbol / meta missing)"
+            )));
         }
         for chunk in cancels.chunks(40) {
             if chunk.is_empty() {
@@ -1254,10 +1516,11 @@ impl Exchange for HyperliquidExchange {
             } else {
                 (true, mid * dec!(1.05))
             };
+            let asset = self.ensure_asset(symbol).await?;
             let action = json!({
                 "type": "order",
                 "orders": [{
-                    "a": self.resolve_asset(symbol)?,
+                    "a": asset,
                     "b": is_buy,
                     "p": float_to_wire(round_perp_price(raw_px, sz_dec)),
                     "s": float_to_wire(abs_sz),
@@ -1340,19 +1603,31 @@ impl Exchange for HyperliquidExchange {
                 };
                 let asset = match self.resolve_asset(coin) {
                     Ok(a) => a,
-                    Err(_) => continue,
+                    Err(_) => match self.ensure_asset(coin).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            warn!("flatten: cannot resolve {coin}: {e}");
+                            continue;
+                        }
+                    },
                 };
                 cancels.push(json!({"a": asset, "o": oid}));
             }
         }
-        for order in self.open_orders.values() {
+        let local_orders: Vec<_> = self.open_orders.values().cloned().collect();
+        for order in local_orders {
             if let Some(oid_str) = &order.exchange_id {
                 if let Ok(oid) = oid_str.parse::<u64>() {
-                    if let Ok(asset) = self.resolve_asset(&order.symbol) {
-                        let item = json!({"a": asset, "o": oid});
-                        if !cancels.iter().any(|c| c == &item) {
-                            cancels.push(item);
-                        }
+                    let asset = match self.resolve_asset(&order.symbol) {
+                        Ok(a) => a,
+                        Err(_) => match self.ensure_asset(&order.symbol).await {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        },
+                    };
+                    let item = json!({"a": asset, "o": oid});
+                    if !cancels.iter().any(|c| c == &item) {
+                        cancels.push(item);
                     }
                 }
             }
@@ -1418,7 +1693,7 @@ impl Exchange for HyperliquidExchange {
                 (true, mid * dec!(1.05))
             };
             let px = round_perp_price(raw_px, sz_dec);
-            let asset = self.resolve_asset(&coin)?;
+            let asset = self.ensure_asset(&coin).await?;
             close_intents.push(json!({
                 "a": asset,
                 "b": is_buy,
@@ -1459,9 +1734,10 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn drain_fills(&mut self) -> ExchangeResult<Vec<FillEvent>> {
+        let mut out = std::mem::take(&mut self.pending_immediate_fills);
         let addr = match &self.address {
             Some(a) => a.clone(),
-            None => return Ok(vec![]),
+            None => return Ok(out),
         };
         // Never treat historical fills as new — prime once if forgotten.
         if !self.fills_primed {
@@ -1474,7 +1750,6 @@ impl Exchange for HyperliquidExchange {
             }))
             .await
             .unwrap_or(json!([]));
-        let mut out = Vec::new();
         // Allow small clock skew vs exchange timestamps.
         let min_fill_ms = self.session_start_ms.saturating_sub(3_000);
         // Newest-first; scan enough to cover a busy grid session.
@@ -1521,25 +1796,45 @@ impl Exchange for HyperliquidExchange {
                     .and_then(|value| value.as_str())
                     .and_then(|value| Decimal::from_str(value).ok())
                     .unwrap_or(Decimal::ZERO);
+                let fee_token = f
+                    .get("feeToken")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let oid = f
                     .get("oid")
                     .and_then(|o| o.as_u64().or_else(|| o.as_i64().map(|i| i as u64)))
                     .map(|o| o.to_string());
+                let crossed = f
+                    .get("crossed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let dir = f
+                    .get("dir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let closed_pnl = f
+                    .get("closedPnl")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Decimal::from_str(s).ok());
+                let cloid = f
+                    .get("cloid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim_start_matches("0x").to_string());
 
-                // Only attribute fills to our bot orders (match exchange oid).
-                let matched = self
-                    .open_orders
-                    .values()
-                    .find(|o| match (&oid, &o.exchange_id) {
-                        (Some(fill_oid), Some(ex_id)) => fill_oid == ex_id,
+                // Only attribute fills to our bot orders (match exchange oid or cloid).
+                let matched = self.open_orders.values().find(|o| {
+                    match (&oid, &o.exchange_id) {
+                        (Some(fill_oid), Some(ex_id)) if fill_oid == ex_id => return true,
+                        _ => {}
+                    }
+                    match (&cloid, &o.cloid) {
+                        (Some(fc), Some(oc)) if !fc.is_empty() && fc == oc => true,
                         _ => false,
-                    });
+                    }
+                });
                 let Some(order) = matched.cloned() else {
-                    // If we still have tracked orders, this fill is external — ignore.
-                    // If the map is empty (client was wiped), leave tid unseen so a
-                    // later restore can still claim the fill.
                     if !self.open_orders.is_empty() {
-                        self.last_seen_fills.push(tid);
+                        self.last_seen_fills.push(tid.clone());
                         if self.last_seen_fills.len() > 500 {
                             self.last_seen_fills.drain(0..100);
                         }
@@ -1547,14 +1842,13 @@ impl Exchange for HyperliquidExchange {
                     continue;
                 };
 
-                self.last_seen_fills.push(tid);
+                self.last_seen_fills.push(tid.clone());
                 if self.last_seen_fills.len() > 500 {
                     self.last_seen_fills.drain(0..100);
                 }
 
                 let client_id = order.client_id.clone();
                 let level_index = order.level_index;
-                // Keep tracking through partial fills until size is exhausted.
                 if let Some(tracked) = self.open_orders.get_mut(&client_id) {
                     let remaining = tracked.size - sz;
                     if remaining.abs() <= Decimal::new(1, 8) || remaining <= Decimal::ZERO {
@@ -1575,6 +1869,18 @@ impl Exchange for HyperliquidExchange {
                     size: sz,
                     level_index,
                     fee,
+                    fee_token,
+                    exchange_tid: Some(tid),
+                    exchange_oid: oid,
+                    cloid: order.cloid.clone().or(cloid),
+                    exchange_time_ms: if fill_ms > 0 {
+                        Some(fill_ms as i64)
+                    } else {
+                        None
+                    },
+                    crossed,
+                    dir,
+                    closed_pnl,
                 });
             }
         }
@@ -1588,6 +1894,133 @@ impl Exchange for HyperliquidExchange {
             .filter(|o| o.symbol == symbol)
             .cloned()
             .collect())
+    }
+
+    async fn list_exchange_open_orders(&self, symbol: &str) -> ExchangeResult<Vec<LiveOrder>> {
+        let addr = match &self.address {
+            Some(a) => a.clone(),
+            None => return Ok(vec![]),
+        };
+        let key = if symbol.is_empty() {
+            String::new()
+        } else {
+            self.resolve_mid_key(symbol)
+        };
+        let open = if let Some(dex) = Self::dex_from_symbol(&key) {
+            self.post_info(json!({"type": "openOrders", "user": &addr, "dex": dex}))
+                .await
+                .unwrap_or(json!([]))
+        } else {
+            self.post_info(json!({"type": "openOrders", "user": &addr}))
+                .await
+                .unwrap_or(json!([]))
+        };
+        let mut out = Vec::new();
+        if let Some(arr) = open.as_array() {
+            for o in arr {
+                let coin = o.get("coin").and_then(|c| c.as_str()).unwrap_or("");
+                if !key.is_empty() && coin != key && coin != symbol {
+                    continue;
+                }
+                let oid = o
+                    .get("oid")
+                    .and_then(|x| x.as_u64())
+                    .map(|v| v.to_string());
+                let side = match o.get("side").and_then(|s| s.as_str()) {
+                    Some("B") | Some("Buy") | Some("buy") => Side::Buy,
+                    _ => Side::Sell,
+                };
+                let px = o
+                    .get("limitPx")
+                    .or_else(|| o.get("px"))
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| Decimal::from_str(s).ok())
+                    .unwrap_or(Decimal::ZERO);
+                let sz = o
+                    .get("sz")
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| Decimal::from_str(s).ok())
+                    .unwrap_or(Decimal::ZERO);
+                let cloid = o
+                    .get("cloid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim_start_matches("0x").to_string());
+                let local = self.open_orders.values().find(|lo| {
+                    lo.exchange_id.as_ref() == oid.as_ref()
+                        || (cloid.is_some() && lo.cloid == cloid)
+                });
+                let client_id = local
+                    .map(|l| l.client_id.clone())
+                    .unwrap_or_else(|| format!("ex-{}", oid.clone().unwrap_or_default()));
+                let level_index = local.map(|l| l.level_index).unwrap_or(0);
+                let reduce_only = local.map(|l| l.reduce_only).unwrap_or(false);
+                out.push(LiveOrder {
+                    client_id,
+                    exchange_id: oid,
+                    symbol: if coin.is_empty() {
+                        symbol.to_string()
+                    } else {
+                        coin.to_string()
+                    },
+                    side,
+                    price: px,
+                    size: sz,
+                    orig_size: local.map(|l| l.orig_size).unwrap_or(sz),
+                    level_index,
+                    reduce_only,
+                    cloid,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_position(&self, symbol: &str) -> ExchangeResult<crate::traits::PositionSnapshot> {
+        let (size, entry, upnl, liq) = self.get_perp_position(symbol).await?;
+        Ok(crate::traits::PositionSnapshot {
+            symbol: symbol.to_string(),
+            size,
+            entry_price: entry,
+            unrealized_pnl: upnl,
+            liquidation_price: liq,
+        })
+    }
+
+    async fn cancel_all_confirmed(
+        &mut self,
+        symbol: &str,
+        max_attempts: u32,
+    ) -> ExchangeResult<crate::traits::CancelReport> {
+        use crate::traits::CancelReport;
+        let mut last_remaining = Vec::new();
+        let attempts = max_attempts.max(1);
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                // Meta may have been wiped mid-session; force HIP-3 reload before retry.
+                let _ = self.ensure_asset(symbol).await;
+            }
+            self.cancel_all(symbol).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1)))
+                .await;
+            let still = self.has_open_orders(symbol).await?;
+            if !still {
+                return Ok(CancelReport {
+                    canceled: 0,
+                    remaining_oids: vec![],
+                    confirmed_flat: true,
+                });
+            }
+            let open = self.list_exchange_open_orders(symbol).await.unwrap_or_default();
+            last_remaining = open
+                .into_iter()
+                .filter_map(|o| o.exchange_id)
+                .collect();
+        }
+        Ok(CancelReport {
+            canceled: 0,
+            remaining_oids: last_remaining,
+            confirmed_flat: false,
+        })
     }
 
     async fn list_spot_symbols(&self) -> ExchangeResult<Vec<String>> {

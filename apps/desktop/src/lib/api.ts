@@ -71,6 +71,17 @@ export type BotSnapshot = {
   unrealized_pnl: string;
   funding_pnl: string;
   events_tail: string[];
+  active_lower?: string | null;
+  active_upper?: string | null;
+  atr?: string | null;
+  atr_pct?: string | null;
+  recenter_generation?: number;
+  recenters_today?: number;
+  last_recenter_ms?: number | null;
+  session_id?: string | null;
+  last_tick_ms?: number | null;
+  health_note?: string | null;
+  grid_mode?: string;
 };
 
 export type ChartInterval = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
@@ -98,6 +109,16 @@ export type AppSettings = {
   chart_mode: string;
   chart_interval: string;
   range_pct?: string;
+  grid_mode?: string;
+  atr_interval?: string;
+  atr_period?: number;
+  atr_mult?: string;
+  confirm_bars?: number;
+  recenter_cooldown_secs?: number;
+  max_recenters_per_day?: number;
+  auto_start?: boolean;
+  resume_on_restart?: boolean;
+  exit_policy?: string;
   env_path?: string;
 };
 
