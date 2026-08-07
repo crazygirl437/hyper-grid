@@ -22,6 +22,7 @@ grid-engine = { path = "../../../crates/grid-engine" }
 exchange = { path = "../../../crates/exchange" }
 storage = { path = "../../../crates/storage" }
 chrono = { workspace = true }
+fs2 = { workspace = true }
 
 [features]
 default = ["custom-protocol"]
